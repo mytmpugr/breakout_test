@@ -21,8 +21,21 @@ st.set_page_config(
 
 BIG_BARS = 10**6
 BATCH_SIZE = 60
-MODE_FRESH = "Taze Buy sinyali (son N bar)"
-MODE_ACTIVE = "Aktif Long (Buy durumunda)"
+
+SIGNAL_FRESH = "fresh"
+SIGNAL_ACTIVE = "active"
+SIGNAL_APPROACH = "approach"
+SIGNAL_ORDER = [SIGNAL_FRESH, SIGNAL_ACTIVE, SIGNAL_APPROACH]
+SIGNAL_LABELS = {
+    SIGNAL_FRESH: "🟢 Taze Buy (son N bar)",
+    SIGNAL_ACTIVE: "🟢 Aktif Long (Buy durumunda)",
+    SIGNAL_APPROACH: "🟡 Yaklaşan (kırılıma yakın)",
+}
+SIGNAL_SHORT = {
+    SIGNAL_FRESH: "Yeni Buy",
+    SIGNAL_ACTIVE: "Aktif Long",
+    SIGNAL_APPROACH: "Yaklaşan",
+}
 
 NO_MARK = "—"
 MARK_OPTIONS = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
@@ -446,6 +459,7 @@ def run_engine(high, low, close, length, mult, method):
     line_up = np.full(n, np.nan)
     line_dn = np.full(n, np.nan)
     slope_up = np.zeros(n)
+    upos_state = np.zeros(n, dtype=int)
     bull = np.zeros(n, dtype=bool)
     bear = np.zeros(n, dtype=bool)
     for i in range(n):
@@ -476,6 +490,7 @@ def run_engine(high, low, close, length, mult, method):
         bull[i] = upos > prev_up
         bear[i] = dnos > prev_dn
         slope_up[i] = slope_ph
+        upos_state[i] = upos
         if seen_ph:
             line_up[i] = upper - slope_ph * length
         if seen_pl:
@@ -486,6 +501,7 @@ def run_engine(high, low, close, length, mult, method):
         "line_up": line_up,
         "line_dn": line_dn,
         "slope_up": slope_up,
+        "upos": upos_state,
         "ph_mask": ~np.isnan(ph),
         "pl_mask": ~np.isnan(pl),
     }
@@ -603,6 +619,8 @@ def analyze_frame(df, length, mult, method):
     line_up_now = engine["line_up"][i]
     line_dn_now = engine["line_dn"][i]
     dist_up = (last_close / line_up_now - 1.0) * 100.0 if not np.isnan(line_up_now) and line_up_now > 0 else np.nan
+    appr_dist = (line_up_now / last_close - 1.0) * 100.0 if not np.isnan(line_up_now) and last_close > 0 else np.nan
+    upos_now = int(engine["upos"][i])
     slope_pct = engine["slope_up"][i] / last_close * 100.0 if last_close > 0 else 0.0
     buy_time = df.index[last_buy].strftime("%Y-%m-%d %H:%M") if last_buy >= 0 else ""
 
@@ -618,6 +636,8 @@ def analyze_frame(df, length, mult, method):
         "line_up": float(line_up_now) if not np.isnan(line_up_now) else np.nan,
         "line_dn": float(line_dn_now) if not np.isnan(line_dn_now) else np.nan,
         "dist_up": dist_up,
+        "appr_dist": appr_dist,
+        "upos": upos_now,
         "slope_pct": slope_pct,
         "rsi": rsi,
         "macd_hist": macd_hist,
@@ -822,12 +842,25 @@ def sidebar_controls():
     st.sidebar.subheader("Sonuç Filtreleri")
 
     with st.sidebar.expander("3) Sinyal", expanded=True):
-        mode = st.radio("Sinyal modu", [MODE_FRESH, MODE_ACTIVE])
-        lookback = st.slider("Taze sinyal: son kaç bar", 0, 10, 2, 1, disabled=(mode != MODE_FRESH))
+        signal_types = st.multiselect(
+            "Sinyal türleri",
+            SIGNAL_ORDER,
+            default=[SIGNAL_FRESH],
+            format_func=lambda k: SIGNAL_LABELS[k],
+        )
+        lookback = st.slider(
+            "Taze Buy: son kaç bar", 0, 10, 2, 1,
+            disabled=(SIGNAL_FRESH not in signal_types),
+        )
+        approach_pct = st.slider(
+            "Yaklaşan: çizgiye en fazla kalan %", 0.1, 10.0, 2.0, 0.1,
+            disabled=(SIGNAL_APPROACH not in signal_types),
+        )
         if len(tfs) > 1:
             min_tf = st.slider("Min. uyumlu zaman dilimi sayısı", 1, len(tfs), 1, 1)
         else:
             min_tf = 1
+        st.caption("Birden fazla tür seçilirse biri sağlanması yeterlidir. Seçim yapılmazsa Taze Buy kullanılır.")
 
     with st.sidebar.expander("4) Teknik", expanded=False):
         rsi_range = st.slider("RSI aralığı", 0, 100, (0, 100))
@@ -860,8 +893,9 @@ def sidebar_controls():
         "closed_only": bool(closed_only),
     }
     flt = {
-        "mode": mode,
+        "signal_types": [k for k in SIGNAL_ORDER if k in signal_types],
         "lookback": int(lookback),
+        "approach_pct": float(approach_pct),
         "min_tf": int(min_tf),
         "rsi": rsi_range,
         "min_rvol": float(min_rvol),
@@ -883,10 +917,26 @@ def compute_views(scan, flt):
     df = df[df["tf"].isin(tfs)].copy()
     if df.empty:
         return None
-    if flt["mode"] == MODE_FRESH:
-        signal = df["in_long"] & (df["buy_ago"] <= flt["lookback"])
+    if "upos" not in df.columns:
+        df["upos"] = 1
+    if "appr_dist" not in df.columns:
+        df["appr_dist"] = np.nan
+
+    types = flt["signal_types"] or [SIGNAL_FRESH]
+    none_series = pd.Series(False, index=df.index)
+    fresh_ok = (df["in_long"] & (df["buy_ago"] <= flt["lookback"])) if SIGNAL_FRESH in types else none_series
+    active_ok = df["in_long"] if SIGNAL_ACTIVE in types else none_series
+    if SIGNAL_APPROACH in types:
+        approach_ok = (df["upos"] == 0) & df["appr_dist"].between(0.0, flt["approach_pct"])
     else:
-        signal = df["in_long"]
+        approach_ok = none_series
+    signal = fresh_ok | active_ok | approach_ok
+    df["kind"] = np.select(
+        [fresh_ok, active_ok, approach_ok],
+        [SIGNAL_FRESH, SIGNAL_ACTIVE, SIGNAL_APPROACH],
+        default="",
+    )
+
     tech = (
         df["rsi"].between(flt["rsi"][0], flt["rsi"][1])
         & (df["rvol"] >= flt["min_rvol"])
@@ -953,9 +1003,18 @@ def build_summary(context, fund, tfs):
             item = part.iloc[0]
             if item["match"]:
                 matches += 1
-                row[tf] = "🟢 Yeni" if item["buy_ago"] == 0 else f"🟢 {int(item['buy_ago'])} bar önce"
+                if item["kind"] == SIGNAL_APPROACH:
+                    row[tf] = f"🟡 Yaklaşıyor %{item['appr_dist']:.2f}"
+                elif item["kind"] == SIGNAL_ACTIVE:
+                    row[tf] = f"🟢 Long ({int(item['buy_ago'])} bar)"
+                elif item["buy_ago"] == 0:
+                    row[tf] = "🟢 Yeni"
+                else:
+                    row[tf] = f"🟢 {int(item['buy_ago'])} bar önce"
                 if best is None or item["skor"] > best["skor"]:
                     best = item
+            elif item["kind"] == SIGNAL_APPROACH:
+                row[tf] = "⚪ Yaklaşıyor (filtre dışı)"
             elif item["in_long"]:
                 row[tf] = "⚪ Long (filtre dışı)"
             else:
@@ -970,6 +1029,7 @@ def build_summary(context, fund, tfs):
         row["RVOL"] = float(best["rvol"])
         row["ADX"] = float(best["adx"])
         row["Çizgiye Mesafe %"] = nz(best["dist_up"], np.nan)
+        row["Çizgiye Kalan %"] = nz(best["appr_dist"], np.nan)
         if info is not None:
             cap = nz(info.get("market_cap_basic"), np.nan)
             row["Piyasa Değeri (Mlr)"] = cap / 1e9 if not np.isnan(cap) else np.nan
@@ -989,14 +1049,17 @@ def build_summary(context, fund, tfs):
 def build_detail_table(matched):
     if matched.empty:
         return pd.DataFrame()
+    buy_ago = matched["buy_ago"].where(matched["buy_ago"] < BIG_BARS)
     table = pd.DataFrame(
         {
             "Hisse": matched["ticker"],
             "Zaman Dilimi": matched["tf"].map(lambda tf: TF_CONFIG[tf]["label"]),
+            "Sinyal Türü": matched["kind"].map(SIGNAL_SHORT),
             "Son Bar": matched["bar_time"],
             "Fiyat": matched["close"],
             "Buy Zamanı": matched["buy_time"],
-            "Kaç Bar Önce": matched["buy_ago"],
+            "Kaç Bar Önce": buy_ago,
+            "Çizgiye Kalan %": matched["appr_dist"],
             "Sinyal Getirisi %": matched["pnl"],
             "Direnç Çizgisi": matched["line_up"],
             "Çizgiye Mesafe %": matched["dist_up"],
@@ -1161,6 +1224,7 @@ def render_summary_tab(views, tfs, market):
         "RVOL": st.column_config.NumberColumn(format="%.2f"),
         "ADX": st.column_config.NumberColumn(format="%.1f"),
         "Çizgiye Mesafe %": st.column_config.NumberColumn(format="%.2f"),
+        "Çizgiye Kalan %": st.column_config.NumberColumn(format="%.2f"),
         "Piyasa Değeri (Mlr)": st.column_config.NumberColumn(format="%.1f"),
         "F/K": st.column_config.NumberColumn(format="%.1f"),
         "1A Perf %": st.column_config.NumberColumn(format="%.1f"),
@@ -1179,6 +1243,8 @@ def render_detail_table_tab(views, market):
     config = {
         "Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f"),
         "Fiyat": st.column_config.NumberColumn(format="%.2f"),
+        "Kaç Bar Önce": st.column_config.NumberColumn(format="%d"),
+        "Çizgiye Kalan %": st.column_config.NumberColumn(format="%.2f"),
         "Direnç Çizgisi": st.column_config.NumberColumn(format="%.2f"),
         "Sinyal Getirisi %": st.column_config.NumberColumn(format="%.2f"),
         "Çizgiye Mesafe %": st.column_config.NumberColumn(format="%.2f"),
@@ -1275,6 +1341,18 @@ def render_visual_tab(views, tfs):
         labels={"dist_up": "Çizgiye Mesafe %", "adx": "ADX"},
     )
     right3.plotly_chart(style_figure(dist_fig, 380), use_container_width=True)
+
+    approach = matched[matched["kind"] == SIGNAL_APPROACH].dropna(subset=["appr_dist"]).copy()
+    if not approach.empty:
+        approach["Zaman Dilimi"] = approach["tf"].map(lambda tf: TF_CONFIG[tf]["label"])
+        approach["size"] = approach["skor"].clip(lower=5)
+        approach_fig = px.scatter(
+            approach, x="appr_dist", y="rvol", size="size", color="Zaman Dilimi",
+            hover_name="ticker", hover_data={"skor": True, "rsi": ":.1f", "adx": ":.1f", "size": False},
+            title="Yaklaşan Hisseler: Çizgiye Kalan % – Göreceli Hacim",
+            labels={"appr_dist": "Çizgiye Kalan %", "rvol": "RVOL"},
+        )
+        st.plotly_chart(style_figure(approach_fig, 420), use_container_width=True)
 
 
 def render_fundamental_tab(views, market):
@@ -1491,12 +1569,15 @@ def render_detail_tab(scan, views):
     extra = pd.DataFrame(
         {
             "Gösterge": [
-                "Direnç çizgisi", "Çizgiye mesafe %", "Eğim %/bar", "Sinyal getirisi %",
-                "MACD histogram", "ATR %", "EMA 20", "EMA 50", "EMA 200", "EMA durumu", "Buy zamanı",
+                "Direnç çizgisi", "Çizgiye mesafe %", "Çizgiye kalan %", "Üst çizgi kırılım durumu",
+                "Eğim %/bar", "Sinyal getirisi %", "MACD histogram", "ATR %",
+                "EMA 20", "EMA 50", "EMA 200", "EMA durumu", "Buy zamanı",
             ],
             "Değer": [
                 f"{result['line_up']:.2f}" if not np.isnan(result["line_up"]) else "—",
                 f"{result['dist_up']:.2f}" if not np.isnan(result["dist_up"]) else "—",
+                f"{result['appr_dist']:.2f}" if not np.isnan(result["appr_dist"]) else "—",
+                "Kırılmış (upos=1)" if result["upos"] == 1 else "Kırılım bekliyor (upos=0)",
                 f"{result['slope_pct']:.3f}",
                 f"{result['pnl']:.2f}" if not np.isnan(result["pnl"]) else "—",
                 f"{result['macd_hist']:.3f}",
@@ -1925,10 +2006,13 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 
 4 saatlik mumlar seansa göre iki parçaya bölünür: ABD 09:30–13:30 / 13:30–16:00, BIST 10:00–14:00 / 14:00–18:00.
 
-### Sinyal Modları
+### Sinyal Türleri
 
-- **Taze Buy:** Son Buy sinyali son N bar içinde ve sonrasında Sell sinyali yok.
-- **Aktif Long:** Son sinyal Buy, henüz Sell sinyali oluşmamış.
+- 🟢 **Taze Buy:** Son Buy sinyali son N bar içinde ve sonrasında Sell sinyali yok. Tabloda `🟢 Yeni` veya `🟢 N bar önce` görünür.
+- 🟢 **Aktif Long:** Son sinyal Buy, henüz Sell sinyali oluşmamış. Tabloda `🟢 Long (N bar)` görünür.
+- 🟡 **Yaklaşan:** Üst trend çizgisi (yeşil direnç çizgisi) henüz kırılmamış (`upos = 0`), son kapanış çizginin altında ve çizgiye kalan mesafe `(çizgi / kapanış − 1) × 100` seçilen eşiğin altında. Tabloda `🟡 Yaklaşıyor %1.25` görünür.
+
+Birden fazla tür seçilirse bunlardan birini sağlayan hisse listelenir. Yaklaşan hisselerde kırılım henüz gerçekleşmemiştir ve gerçekleşeceğinin garantisi yoktur.
 
 ### Tablolar: Filtreleme ve İşaretleme
 
@@ -1956,6 +2040,8 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 | EMA 50 > EMA 200 | 5 |
 | MACD histogram > 0 | 5 |
 
+Yaklaşan hisselerde Buy sinyali henüz oluşmadığı için tazelik puanı alınmaz. Bu nedenle skorları genelde daha düşüktür. "Min. Breakout Skoru" filtresini buna göre ayarlayın.
+
 ### Notlar
 
 - "Yalnızca kapanmış barlar" açıkken oluşmakta olan bar hesaplamaya katılmaz.
@@ -1971,7 +2057,7 @@ def render_welcome():
         **🚀 Taramayı Başlat** düğmesine basın.
 
         Uygulama, TradingView Scanner üzerinden hisse listesini alır, `yfinance` ile fiyat verilerini çeker
-        ve LuxAlgo *Trendlines with Breaks* mantığıyla **Buy** sinyalindeki hisseleri bulur.
+        ve LuxAlgo *Trendlines with Breaks* mantığıyla **Buy** sinyalindeki ve **kırılıma yaklaşan** hisseleri bulur.
         """
     )
     st.info("İlk tarama, hisse sayısına bağlı olarak 1–3 dakika sürebilir. Sonraki taramalar önbellekten hızlı gelir.")
@@ -2018,13 +2104,16 @@ def main():
         return
 
     summary = views["summary"]
+    matched = views["matched"]
     tfs = scan["params"]["tfs"]
-    c1, c2, c3, c4, c5 = st.columns(5)
+    approach_count = int(matched.loc[matched["kind"] == SIGNAL_APPROACH, "ticker"].nunique()) if not matched.empty else 0
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Taranan Hisse", f"{scan['raw']['ticker'].nunique()}")
     c2.metric("Eşleşen Hisse", f"{len(summary)}")
-    c3.metric("Eşleşen Sinyal", f"{len(views['matched'])}")
-    c4.metric("Tüm TF Uyumlu", f"{int((summary['Uyum'] == len(tfs)).sum()) if not summary.empty else 0}")
-    c5.metric("Son Tarama", scan["time"])
+    c3.metric("Eşleşen Sinyal", f"{len(matched)}")
+    c4.metric("Yaklaşan Hisse", f"{approach_count}")
+    c5.metric("Tüm TF Uyumlu", f"{int((summary['Uyum'] == len(tfs)).sum()) if not summary.empty else 0}")
+    c6.metric("Son Tarama", scan["time"])
 
     tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
         [
