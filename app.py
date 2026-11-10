@@ -19,14 +19,52 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-NY_TZ = "America/New_York"
 BIG_BARS = 10**6
 BATCH_SIZE = 60
 MODE_FRESH = "Taze Buy sinyali (son N bar)"
 MODE_ACTIVE = "Aktif Long (Buy durumunda)"
 
-mkt_config = {"tv_market": "america", "exchanges": ["NASDAQ", "NYSE"]}
-TV_URL = f"https://scanner.tradingview.com/{mkt_config['tv_market']}/scan"
+NO_MARK = "—"
+MARK_OPTIONS = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+EMOJI_TO_MARK = {emoji: name for name, emoji in MARK_OPTIONS.items()}
+MARK_CSS = {
+    "green": "background-color: rgba(34, 197, 94, 0.28);",
+    "yellow": "background-color: rgba(234, 179, 8, 0.32);",
+    "red": "background-color: rgba(239, 68, 68, 0.30);",
+}
+
+MARKETS = {
+    "us": {
+        "label": "🇺🇸 Amerika (NASDAQ & NYSE)",
+        "tv_market": "america",
+        "exchanges": ["NASDAQ", "NYSE"],
+        "suffix": "",
+        "dot_to_dash": True,
+        "tz": "America/New_York",
+        "tz_label": "ET",
+        "open_min": 570,
+        "split_min": 810,
+        "close_min": 960,
+        "currency": "$",
+        "common_only": True,
+        "defaults": {"limit": 300, "min_cap": 1000, "min_price": 5.0, "min_volume": 300000},
+    },
+    "tr": {
+        "label": "🇹🇷 Türkiye (BIST)",
+        "tv_market": "turkey",
+        "exchanges": ["BIST"],
+        "suffix": ".IS",
+        "dot_to_dash": False,
+        "tz": "Europe/Istanbul",
+        "tz_label": "TRT",
+        "open_min": 600,
+        "split_min": 840,
+        "close_min": 1080,
+        "currency": "₺",
+        "common_only": False,
+        "defaults": {"limit": 300, "min_cap": 1000, "min_price": 1.0, "min_volume": 500000},
+    },
+}
 
 TF_ORDER = ["1h", "4h", "1d", "1w"]
 TF_CONFIG = {
@@ -35,8 +73,14 @@ TF_CONFIG = {
     "1d": {"interval": "1d", "period": "2y", "label": "1 Gün"},
     "1w": {"interval": "1wk", "period": "10y", "label": "1 Hafta"},
 }
+BT_PERIODS = {
+    "1h": ["3mo", "6mo", "1y"],
+    "4h": ["3mo", "6mo", "1y"],
+    "1d": ["1y", "2y", "5y", "10y", "max"],
+    "1w": ["5y", "10y", "max"],
+}
 
-TEXT_COLUMNS = {"name", "description", "exchange", "sector", "industry", "tv_symbol", "ticker"}
+TEXT_COLUMNS = {"name", "description", "exchange", "sector", "industry", "tv_symbol", "ticker", "symbol"}
 MIN_COLUMNS = [
     "name", "description", "exchange", "sector", "industry",
     "close", "volume", "market_cap_basic",
@@ -55,9 +99,9 @@ EXTENDED_COLUMNS = BASE_COLUMNS + [
 COLUMN_SETS = [EXTENDED_COLUMNS, BASE_COLUMNS, MIN_COLUMNS]
 
 FUND_LABELS = {
-    "market_cap_basic": "Piyasa Değeri ($)",
+    "market_cap_basic": "Piyasa Değeri",
     "price_earnings_ttm": "F/K",
-    "earnings_per_share_diluted_ttm": "HBK ($)",
+    "earnings_per_share_diluted_ttm": "HBK",
     "dividends_yield_current": "Temettü Verimi %",
     "beta_1_year": "Beta (1Y)",
     "price_book_fq": "PD/DD",
@@ -130,16 +174,19 @@ def get_http_session():
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_universe(limit, min_cap, min_price, min_volume):
+def fetch_universe(market, limit, min_cap, min_price, min_volume):
+    mkt_config = MARKETS[market]
+    tv_url = f"https://scanner.tradingview.com/{mkt_config['tv_market']}/scan"
     session = get_http_session()
     filters = [
         {"left": "type", "operation": "equal", "right": "stock"},
         {"left": "exchange", "operation": "in_range", "right": mkt_config["exchanges"]},
-        {"left": "typespecs", "operation": "has", "right": ["common"]},
         {"left": "market_cap_basic", "operation": "egreater", "right": float(min_cap)},
         {"left": "close", "operation": "egreater", "right": float(min_price)},
         {"left": "volume", "operation": "egreater", "right": float(min_volume)},
     ]
+    if mkt_config["common_only"]:
+        filters.insert(2, {"left": "typespecs", "operation": "has", "right": ["common"]})
     last_error = ""
     for columns in COLUMN_SETS:
         payload = {
@@ -152,7 +199,7 @@ def fetch_universe(limit, min_cap, min_price, min_volume):
             "range": [0, int(limit)],
         }
         try:
-            response = session.post(TV_URL, json=payload, timeout=25)
+            response = session.post(tv_url, json=payload, timeout=25)
             if response.status_code != 200:
                 last_error = f"TradingView Scanner HTTP {response.status_code}"
                 continue
@@ -175,9 +222,12 @@ def fetch_universe(limit, min_cap, min_price, min_volume):
         for column in df.columns:
             if column not in TEXT_COLUMNS:
                 df[column] = pd.to_numeric(df[column], errors="coerce")
-        df["ticker"] = df["name"].astype(str).str.upper().str.replace(".", "-", regex=False)
+        df["ticker"] = df["name"].astype(str).str.upper()
+        if mkt_config["dot_to_dash"]:
+            df["ticker"] = df["ticker"].str.replace(".", "-", regex=False)
         df = df[df["ticker"].str.match(r"^[A-Z][A-Z0-9\-]{0,5}$")]
         df = df.drop_duplicates("ticker").reset_index(drop=True)
+        df["symbol"] = df["ticker"] + mkt_config["suffix"]
         df["sector"] = df["sector"].fillna("Diğer")
         df["industry"] = df["industry"].fillna("Diğer")
         df["description"] = df["description"].fillna(df["ticker"])
@@ -185,7 +235,7 @@ def fetch_universe(limit, min_cap, min_price, min_volume):
     return pd.DataFrame(), last_error
 
 
-def extract_frames(raw, tickers):
+def extract_frames(raw, symbols):
     frames = {}
     columns = ["Open", "High", "Low", "Close", "Volume"]
     if raw is None or raw.empty:
@@ -195,29 +245,29 @@ def extract_frames(raw, tickers):
             raw = raw.swaplevel(0, 1, axis=1)
         raw = raw.sort_index(axis=1)
         available = set(raw.columns.get_level_values(0))
-        for ticker in tickers:
-            if ticker not in available:
+        for symbol in symbols:
+            if symbol not in available:
                 continue
-            sub = raw[ticker]
+            sub = raw[symbol]
             if not all(col in sub.columns for col in columns):
                 continue
             sub = sub[columns].dropna(subset=["Open", "High", "Low", "Close"])
             if not sub.empty:
-                frames[ticker] = sub
-    elif len(tickers) == 1 and all(col in raw.columns for col in columns):
+                frames[symbol] = sub
+    elif len(symbols) == 1 and all(col in raw.columns for col in columns):
         sub = raw[columns].dropna(subset=["Open", "High", "Low", "Close"])
         if not sub.empty:
-            frames[tickers[0]] = sub
+            frames[symbols[0]] = sub
     return frames
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=24)
-def download_batch(tickers, interval, period):
+def download_batch(symbols, interval, period):
     raw = None
     for attempt in range(3):
         try:
             raw = yf.download(
-                list(tickers),
+                list(symbols),
                 period=period,
                 interval=interval,
                 group_by="ticker",
@@ -232,38 +282,47 @@ def download_batch(tickers, interval, period):
             raw = None
         time.sleep(1.2 * (attempt + 1))
     try:
-        return extract_frames(raw, list(tickers))
+        return extract_frames(raw, list(symbols))
     except Exception:
         return {}
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=32)
-def fetch_history(ticker, tf):
+def fetch_history(ticker, tf, market):
     cfg = TF_CONFIG[tf]
-    frames = download_batch((ticker,), cfg["interval"], cfg["period"])
-    return frames.get(ticker)
+    symbol = ticker + MARKETS[market]["suffix"]
+    frames = download_batch((symbol,), cfg["interval"], cfg["period"])
+    return frames.get(symbol)
 
 
-def localize_ny(df, tf):
+@st.cache_data(ttl=300, show_spinner=False, max_entries=24)
+def fetch_history_period(ticker, tf, market, period):
+    cfg = TF_CONFIG[tf]
+    symbol = ticker + MARKETS[market]["suffix"]
+    frames = download_batch((symbol,), cfg["interval"], period)
+    return frames.get(symbol)
+
+
+def localize_market(df, tf, tz):
     df = df.copy()
     idx = pd.DatetimeIndex(df.index)
     if tf in ("1d", "1w"):
         if idx.tz is not None:
             idx = idx.tz_localize(None)
-        idx = idx.normalize().tz_localize(NY_TZ)
+        idx = idx.normalize().tz_localize(tz)
     else:
         if idx.tz is None:
-            idx = idx.tz_localize("UTC").tz_convert(NY_TZ)
+            idx = idx.tz_localize("UTC").tz_convert(tz)
         else:
-            idx = idx.tz_convert(NY_TZ)
+            idx = idx.tz_convert(tz)
     df.index = idx
     return df
 
 
-def resample_4h(df):
+def resample_4h(df, split_min):
     work = df.copy()
     work["_d"] = work.index.normalize()
-    work["_b"] = ((work.index.hour * 60 + work.index.minute) >= 810).astype(int)
+    work["_b"] = ((work.index.hour * 60 + work.index.minute) >= split_min).astype(int)
     work["_ts"] = work.index
     grouped = work.groupby(["_d", "_b"], sort=True).agg(
         Open=("Open", "first"),
@@ -277,34 +336,36 @@ def resample_4h(df):
     return grouped.drop(columns="_ts").sort_index()
 
 
-def bar_end_time(ts, tf):
+def bar_end_time(ts, tf, mkt):
     day = ts.normalize()
+    close_time = day + pd.Timedelta(minutes=mkt["close_min"])
     if tf == "1h":
-        return min(ts + pd.Timedelta(hours=1), day + pd.Timedelta(hours=16))
+        return min(ts + pd.Timedelta(hours=1), close_time)
     if tf == "4h":
         minutes = ts.hour * 60 + ts.minute
-        if minutes < 810:
-            return day + pd.Timedelta(hours=13, minutes=30)
-        return day + pd.Timedelta(hours=16)
+        if minutes < mkt["split_min"]:
+            return day + pd.Timedelta(minutes=mkt["split_min"])
+        return close_time
     if tf == "1d":
-        return day + pd.Timedelta(hours=16)
+        return close_time
     monday = day - pd.Timedelta(days=ts.weekday())
-    return monday + pd.Timedelta(days=4, hours=16)
+    return monday + pd.Timedelta(days=4, minutes=mkt["close_min"])
 
 
-def prepare_frame(raw, tf, closed_only):
+def prepare_frame(raw, tf, closed_only, market):
+    mkt = MARKETS[market]
     df = raw.copy()
     df = df[~df.index.duplicated(keep="last")].sort_index()
     df = df.dropna(subset=["Open", "High", "Low", "Close"])
     if df.empty:
         return df
-    df = localize_ny(df, tf)
+    df = localize_market(df, tf, mkt["tz"])
     if tf == "4h":
-        df = resample_4h(df)
+        df = resample_4h(df, mkt["split_min"])
     df["Volume"] = df["Volume"].fillna(0.0)
     if closed_only and len(df) > 0:
-        now = pd.Timestamp.now(tz=NY_TZ)
-        if bar_end_time(df.index[-1], tf) > now:
+        now = pd.Timestamp.now(tz=mkt["tz"])
+        if bar_end_time(df.index[-1], tf, mkt) > now:
             df = df.iloc[:-1]
     return df
 
@@ -572,16 +633,18 @@ def analyze_frame(df, length, mult, method):
 
 
 @st.cache_data(ttl=300, show_spinner=False, max_entries=64)
-def scan_batch(tickers, tf, length, mult, method, closed_only):
+def scan_batch(tickers, tf, length, mult, method, closed_only, market):
     cfg = TF_CONFIG[tf]
-    frames = download_batch(tickers, cfg["interval"], cfg["period"])
+    suffix = MARKETS[market]["suffix"]
+    symbols = tuple(t + suffix for t in tickers)
+    frames = download_batch(symbols, cfg["interval"], cfg["period"])
     rows = []
     for ticker in tickers:
-        raw = frames.get(ticker)
+        raw = frames.get(ticker + suffix)
         if raw is None or raw.empty:
             continue
         try:
-            df = prepare_frame(raw, tf, closed_only)
+            df = prepare_frame(raw, tf, closed_only, market)
             result = analyze_frame(df, length, mult, method)
         except Exception:
             continue
@@ -594,8 +657,9 @@ def scan_batch(tickers, tf, length, mult, method, closed_only):
 
 
 def run_scan(params):
+    market = params["market"]
     universe, error = fetch_universe(
-        params["limit"], params["min_cap"] * 1_000_000, params["min_price"], params["min_volume"]
+        market, params["limit"], params["min_cap"] * 1_000_000, params["min_price"], params["min_volume"]
     )
     if universe.empty:
         st.error(f"Hisse listesi alınamadı. {error}")
@@ -611,7 +675,7 @@ def run_scan(params):
                 rows.extend(
                     scan_batch(
                         tuple(batch), tf, params["length"], params["mult"],
-                        params["method"], params["closed_only"],
+                        params["method"], params["closed_only"], market,
                     )
                 )
             except Exception:
@@ -625,25 +689,119 @@ def run_scan(params):
         st.error("Hiçbir hisse için fiyat verisi alınamadı. Lütfen birkaç dakika sonra tekrar deneyin.")
         return None
     raw_df = pd.DataFrame(rows)
+    mkt = MARKETS[market]
     return {
         "raw": raw_df,
         "uni": universe,
         "params": dict(params),
         "failures": failures,
-        "time": pd.Timestamp.now(tz=NY_TZ).strftime("%Y-%m-%d %H:%M:%S ET"),
+        "time": pd.Timestamp.now(tz=mkt["tz"]).strftime("%Y-%m-%d %H:%M:%S ") + mkt["tz_label"],
     }
+
+
+def marks_store():
+    if "marks" not in st.session_state:
+        st.session_state["marks"] = {}
+    return st.session_state["marks"]
+
+
+def mark_key(market, ticker):
+    return f"{market}:{ticker}"
+
+
+def get_mark_emoji(market, ticker):
+    mark = marks_store().get(mark_key(market, ticker))
+    return MARK_OPTIONS.get(mark, NO_MARK)
+
+
+def apply_marks(market, tickers, mark):
+    store = marks_store()
+    for ticker in tickers:
+        if mark is None:
+            store.pop(mark_key(market, ticker), None)
+        else:
+            store[mark_key(market, ticker)] = mark
+
+
+def get_nonce(key):
+    return st.session_state.get("sel_nonce", {}).get(key, 0)
+
+
+def bump_nonce(key):
+    nonces = st.session_state.setdefault("sel_nonce", {})
+    nonces[key] = nonces.get(key, 0) + 1
+
+
+def render_marks_sidebar():
+    store = marks_store()
+    with st.sidebar.expander("6) 🏷️ İşaretler", expanded=False):
+        summary = "  ".join(
+            f"{emoji} {sum(1 for v in store.values() if v == name)}" for name, emoji in MARK_OPTIONS.items()
+        )
+        st.write(summary)
+        rows = [
+            {"market": k.split(":", 1)[0], "ticker": k.split(":", 1)[1], "mark": v}
+            for k, v in store.items()
+        ]
+        export = pd.DataFrame(rows, columns=["market", "ticker", "mark"])
+        st.download_button(
+            "⬇️ İşaretleri indir (CSV)",
+            export.to_csv(index=False).encode("utf-8-sig"),
+            "isaretler.csv",
+            "text/csv",
+            key="marks_download",
+            use_container_width=True,
+        )
+        uploaded = st.file_uploader("İşaretleri içe aktar (CSV)", type=["csv"], key="marks_upload")
+        if uploaded is not None:
+            signature = f"{uploaded.name}:{uploaded.size}"
+            if st.session_state.get("marks_signature") != signature:
+                try:
+                    data = pd.read_csv(uploaded)
+                    for _, item in data.iterrows():
+                        market_code = str(item["market"])
+                        mark_name = str(item["mark"])
+                        if market_code in MARKETS and mark_name in MARK_OPTIONS:
+                            store[mark_key(market_code, str(item["ticker"]).upper())] = mark_name
+                    st.session_state["marks_signature"] = signature
+                    st.toast("İşaretler içe aktarıldı.")
+                except Exception as exc:
+                    st.error(f"CSV okunamadı: {exc}")
+        if st.button("🗑️ Tüm işaretleri temizle", key="marks_clear", use_container_width=True):
+            store.clear()
+            st.rerun()
+        st.caption("İşaretler oturum boyunca saklanır. Kalıcı olması için CSV olarak indirin.")
 
 
 def sidebar_controls():
     scan = st.session_state.get("scan")
     st.sidebar.title("📈 Breakout Screener")
-    st.sidebar.caption("NASDAQ • NYSE  |  LuxAlgo Trendlines with Breaks (Long Only)")
+    market = st.sidebar.radio(
+        "Piyasa",
+        list(MARKETS.keys()),
+        format_func=lambda k: MARKETS[k]["label"],
+    )
+    mkt = MARKETS[market]
+    defaults = mkt["defaults"]
+    st.sidebar.caption("LuxAlgo Trendlines with Breaks (Long Only)")
 
     with st.sidebar.expander("1) Evren ve Veri", expanded=True):
-        limit = st.slider("Taranacak hisse sayısı (piyasa değerine göre)", 100, 1500, 300, 50)
-        min_cap = st.number_input("Min. piyasa değeri (Milyon $)", 0, 500000, 1000, 100)
-        min_price = st.number_input("Min. fiyat ($)", 0.0, 10000.0, 5.0, 1.0)
-        min_volume = st.number_input("Min. günlük hacim (adet)", 0, 100_000_000, 300000, 50000)
+        limit = st.slider(
+            "Taranacak hisse sayısı (piyasa değerine göre)", 100, 1500, defaults["limit"], 50,
+            key=f"limit_{market}",
+        )
+        min_cap = st.number_input(
+            f"Min. piyasa değeri (Milyon {mkt['currency']})", 0, 10_000_000, defaults["min_cap"], 100,
+            key=f"min_cap_{market}",
+        )
+        min_price = st.number_input(
+            f"Min. fiyat ({mkt['currency']})", 0.0, 100000.0, float(defaults["min_price"]), 0.5,
+            key=f"min_price_{market}",
+        )
+        min_volume = st.number_input(
+            "Min. günlük hacim (adet)", 0, 1_000_000_000, defaults["min_volume"], 50000,
+            key=f"min_volume_{market}",
+        )
         tfs = st.multiselect(
             "Zaman dilimleri",
             TF_ORDER,
@@ -687,7 +845,10 @@ def sidebar_controls():
         pos_eps = st.checkbox("Yalnızca pozitif HBK")
         max_dist52 = st.slider("52H zirvesine maks. uzaklık % (100 = kapalı)", 5, 100, 100, 5)
 
+    render_marks_sidebar()
+
     params = {
+        "market": market,
         "limit": int(limit),
         "min_cap": int(min_cap),
         "min_price": float(min_price),
@@ -804,14 +965,14 @@ def build_summary(context, fund, tfs):
         row["Uyum"] = matches
         row["Skor"] = float(best["skor"])
         row["En İyi TF"] = TF_CONFIG[best["tf"]]["label"]
-        row["Fiyat ($)"] = float(best["close"])
+        row["Fiyat"] = float(best["close"])
         row["RSI"] = float(best["rsi"])
         row["RVOL"] = float(best["rvol"])
         row["ADX"] = float(best["adx"])
         row["Çizgiye Mesafe %"] = nz(best["dist_up"], np.nan)
         if info is not None:
             cap = nz(info.get("market_cap_basic"), np.nan)
-            row["Piyasa Değeri (Mlr $)"] = cap / 1e9 if not np.isnan(cap) else np.nan
+            row["Piyasa Değeri (Mlr)"] = cap / 1e9 if not np.isnan(cap) else np.nan
             row["F/K"] = nz(info.get("price_earnings_ttm"), np.nan)
             row["1A Perf %"] = nz(info.get("Perf.1M"), np.nan)
             high52 = nz(info.get("price_52_week_high"), np.nan)
@@ -833,11 +994,11 @@ def build_detail_table(matched):
             "Hisse": matched["ticker"],
             "Zaman Dilimi": matched["tf"].map(lambda tf: TF_CONFIG[tf]["label"]),
             "Son Bar": matched["bar_time"],
-            "Fiyat ($)": matched["close"],
+            "Fiyat": matched["close"],
             "Buy Zamanı": matched["buy_time"],
             "Kaç Bar Önce": matched["buy_ago"],
             "Sinyal Getirisi %": matched["pnl"],
-            "Direnç Çizgisi ($)": matched["line_up"],
+            "Direnç Çizgisi": matched["line_up"],
             "Çizgiye Mesafe %": matched["dist_up"],
             "Eğim %/bar": matched["slope_pct"],
             "RSI": matched["rsi"],
@@ -856,7 +1017,137 @@ def csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def render_summary_tab(views, tfs):
+def row_style(row):
+    mark = EMOJI_TO_MARK.get(row["İşaret"])
+    css = MARK_CSS.get(mark, "")
+    return [css] * len(row)
+
+
+def table_filters(df, key):
+    filtered = df
+    with st.expander("🔎 Tablo filtreleri ve sıralama", expanded=False):
+        search = st.text_input("Hisse / şirket ara", key=f"{key}_search")
+        candidates = [c for c in df.columns if c not in ("Hisse", "Şirket")]
+        signature = abs(hash(tuple(candidates))) % 10**8
+        chosen = st.multiselect(
+            "Filtre uygulanacak sütunlar (çoklu seçim)",
+            candidates,
+            key=f"{key}_cols_{signature}",
+        )
+        mask = pd.Series(True, index=df.index)
+        if search.strip():
+            term = search.strip().lower()
+            match = df["Hisse"].astype(str).str.lower().str.contains(term, regex=False)
+            if "Şirket" in df.columns:
+                match = match | df["Şirket"].astype(str).str.lower().str.contains(term, regex=False)
+            mask &= match
+        for column in chosen:
+            series = df[column]
+            if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+                values = series.dropna()
+                if values.empty:
+                    continue
+                low = float(values.min())
+                high = float(values.max())
+                if low == high:
+                    st.caption(f"{column}: tüm satırlarda {low:g}")
+                    continue
+                widget_key = f"{key}_f_{column}_{round(low, 4)}_{round(high, 4)}"
+                if pd.api.types.is_integer_dtype(series):
+                    picked = st.slider(column, int(low), int(high), (int(low), int(high)), key=widget_key)
+                else:
+                    picked = st.slider(
+                        column, low, high, (low, high), step=(high - low) / 200.0,
+                        format="%.4g", key=widget_key,
+                    )
+                if picked[0] > low or picked[1] < high:
+                    mask &= series.between(picked[0], picked[1])
+            else:
+                options = sorted(series.dropna().astype(str).unique().tolist())
+                if not options:
+                    continue
+                option_sig = abs(hash(tuple(options))) % 10**8
+                picked = st.multiselect(column, options, key=f"{key}_f_{column}_{option_sig}")
+                if picked:
+                    mask &= series.astype(str).isin(picked)
+        filtered = df[mask]
+        sort_col_key = f"{key}_sort_{signature}"
+        left, right = st.columns([2, 1])
+        sort_col = left.selectbox("Sırala", ["(varsayılan sıra)"] + list(df.columns), key=sort_col_key)
+        direction = right.radio("Yön", ["Azalan", "Artan"], horizontal=True, key=f"{key}_dir_{signature}")
+        if sort_col != "(varsayılan sıra)":
+            filtered = filtered.sort_values(sort_col, ascending=(direction == "Artan"), na_position="last")
+    return filtered
+
+
+def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file_name="tablo.csv"):
+    if df is None or df.empty:
+        st.info("Gösterilecek satır yok.")
+        return
+    work = df.copy().reset_index(drop=True)
+    work = work.replace([np.inf, -np.inf], np.nan)
+    work.insert(0, "İşaret", [get_mark_emoji(market, t) for t in work[ticker_col]])
+    filtered = table_filters(work, key).reset_index(drop=True)
+    st.caption(
+        f"Gösterilen satır: {len(filtered)} / {len(work)}   ·   🟢 Yeşil   🟡 Sarı   🔴 Kırmızı   "
+        "(satırların solundaki kutularla seçip aşağıdaki düğmelerle işaretleyin)"
+    )
+    if filtered.empty:
+        st.info("Filtrelerle eşleşen satır yok.")
+        return
+    config = dict(column_config)
+    config["İşaret"] = st.column_config.TextColumn("İşaret", width="small")
+    row_signature = abs(hash(tuple(filtered[ticker_col].astype(str).tolist()))) % 10**8
+    event = st.dataframe(
+        filtered.style.apply(row_style, axis=1),
+        column_config=config,
+        hide_index=True,
+        use_container_width=True,
+        height=min(720, 60 + 36 * len(filtered)),
+        on_select="rerun",
+        selection_mode="multi-row",
+        key=f"{key}_df_{get_nonce(key)}_{row_signature}",
+    )
+    try:
+        selected_rows = list(event.selection.rows)
+    except Exception:
+        selected_rows = []
+    scope = st.radio(
+        "İşaret kapsamı",
+        ["Seçili satırlar", "Tablodaki tüm satırlar"],
+        horizontal=True,
+        key=f"{key}_scope",
+    )
+    actions = [
+        ("🟢 Yeşil", "green"),
+        ("🟡 Sarı", "yellow"),
+        ("🔴 Kırmızı", "red"),
+        ("⚪ İşareti kaldır", None),
+    ]
+    columns = st.columns(len(actions) + 1)
+    for column, (label, mark) in zip(columns, actions):
+        if column.button(label, key=f"{key}_btn_{mark}", use_container_width=True):
+            if scope == "Seçili satırlar":
+                tickers = filtered.iloc[selected_rows][ticker_col].astype(str).tolist() if selected_rows else []
+            else:
+                tickers = filtered[ticker_col].astype(str).tolist()
+            if not tickers:
+                st.warning("Önce tabloda en az bir satır seçin.")
+            else:
+                apply_marks(market, tickers, mark)
+                bump_nonce(key)
+                st.rerun()
+    columns[-1].download_button(
+        "⬇️ CSV",
+        csv_bytes(filtered),
+        file_name,
+        "text/csv",
+        key=f"{key}_download",
+        use_container_width=True,
+    )
+
+
+def render_summary_tab(views, tfs, market):
     summary = views["summary"]
     if summary.empty:
         st.info("Seçili filtrelerle eşleşen hisse bulunamadı. Filtreleri gevşetmeyi deneyin.")
@@ -865,63 +1156,40 @@ def render_summary_tab(views, tfs):
         "Hisse": st.column_config.TextColumn("Hisse", width="small"),
         "Uyum": st.column_config.NumberColumn("Uyum (TF)", format="%d"),
         "Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f"),
-        "Fiyat ($)": st.column_config.NumberColumn(format="%.2f"),
+        "Fiyat": st.column_config.NumberColumn(format="%.2f"),
         "RSI": st.column_config.NumberColumn(format="%.1f"),
         "RVOL": st.column_config.NumberColumn(format="%.2f"),
         "ADX": st.column_config.NumberColumn(format="%.1f"),
         "Çizgiye Mesafe %": st.column_config.NumberColumn(format="%.2f"),
-        "Piyasa Değeri (Mlr $)": st.column_config.NumberColumn(format="%.1f"),
+        "Piyasa Değeri (Mlr)": st.column_config.NumberColumn(format="%.1f"),
         "F/K": st.column_config.NumberColumn(format="%.1f"),
         "1A Perf %": st.column_config.NumberColumn(format="%.1f"),
         "52H Uzaklık %": st.column_config.NumberColumn(format="%.1f"),
     }
     first = ["Hisse", "Şirket", "Sektör", "Uyum"] + list(tfs)
     rest = [c for c in summary.columns if c not in first]
-    st.dataframe(
-        summary[first + rest],
-        column_config=config,
-        hide_index=True,
-        use_container_width=True,
-        height=min(720, 60 + 36 * len(summary)),
-    )
-    st.download_button(
-        "⬇️ Özet tabloyu CSV indir",
-        csv_bytes(summary),
-        "breakout_ozet.csv",
-        "text/csv",
-    )
+    render_marked_table(summary[first + rest], "tbl_summary", market, config, file_name="breakout_ozet.csv")
 
 
-def render_detail_table_tab(views):
+def render_detail_table_tab(views, market):
     table = build_detail_table(views["matched"])
     if table.empty:
         st.info("Eşleşen sinyal bulunamadı.")
         return
-    st.dataframe(
-        table,
-        column_config={
-            "Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f"),
-            "Fiyat ($)": st.column_config.NumberColumn(format="%.2f"),
-            "Direnç Çizgisi ($)": st.column_config.NumberColumn(format="%.2f"),
-            "Sinyal Getirisi %": st.column_config.NumberColumn(format="%.2f"),
-            "Çizgiye Mesafe %": st.column_config.NumberColumn(format="%.2f"),
-            "Eğim %/bar": st.column_config.NumberColumn(format="%.3f"),
-            "RSI": st.column_config.NumberColumn(format="%.1f"),
-            "MACD Hist": st.column_config.NumberColumn(format="%.3f"),
-            "ADX": st.column_config.NumberColumn(format="%.1f"),
-            "RVOL": st.column_config.NumberColumn(format="%.2f"),
-            "ATR %": st.column_config.NumberColumn(format="%.2f"),
-        },
-        hide_index=True,
-        use_container_width=True,
-        height=min(720, 60 + 36 * len(table)),
-    )
-    st.download_button(
-        "⬇️ Detay tabloyu CSV indir",
-        csv_bytes(table),
-        "breakout_detay.csv",
-        "text/csv",
-    )
+    config = {
+        "Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f"),
+        "Fiyat": st.column_config.NumberColumn(format="%.2f"),
+        "Direnç Çizgisi": st.column_config.NumberColumn(format="%.2f"),
+        "Sinyal Getirisi %": st.column_config.NumberColumn(format="%.2f"),
+        "Çizgiye Mesafe %": st.column_config.NumberColumn(format="%.2f"),
+        "Eğim %/bar": st.column_config.NumberColumn(format="%.3f"),
+        "RSI": st.column_config.NumberColumn(format="%.1f"),
+        "MACD Hist": st.column_config.NumberColumn(format="%.3f"),
+        "ADX": st.column_config.NumberColumn(format="%.1f"),
+        "RVOL": st.column_config.NumberColumn(format="%.2f"),
+        "ATR %": st.column_config.NumberColumn(format="%.2f"),
+    }
+    render_marked_table(table, "tbl_detail", market, config, file_name="breakout_detay.csv")
 
 
 def style_figure(fig, height=380):
@@ -1009,7 +1277,7 @@ def render_visual_tab(views, tfs):
     right3.plotly_chart(style_figure(dist_fig, 380), use_container_width=True)
 
 
-def render_fundamental_tab(views):
+def render_fundamental_tab(views, market):
     summary = views["summary"]
     fund = views["fund"]
     if summary.empty:
@@ -1018,37 +1286,35 @@ def render_fundamental_tab(views):
     tickers = summary["Hisse"].tolist()
     available = [c for c in FUND_LABELS if c in fund.columns]
     table = fund.loc[fund.index.isin(tickers), available].copy()
-    table["Analist"] = fund.loc[table.index, "Recommend.All"].map(recommend_label) if "Recommend.All" in fund.columns else "—"
+    if "Recommend.All" in fund.columns:
+        table["Analist"] = fund.loc[table.index, "Recommend.All"].map(recommend_label)
+    else:
+        table["Analist"] = "—"
     if "market_cap_basic" in table.columns:
         table["market_cap_basic"] = table["market_cap_basic"] / 1e9
-    table = table.rename(columns=FUND_LABELS).rename(columns={"Piyasa Değeri ($)": "Piyasa Değeri (Mlr $)"})
+    table = table.rename(columns=FUND_LABELS).rename(columns={"Piyasa Değeri": "Piyasa Değeri (Mlr)"})
     table.insert(0, "Sektör", fund.loc[table.index, "sector"])
     table.insert(0, "Hisse", table.index)
     table["Skor"] = table["Hisse"].map(summary.set_index("Hisse")["Skor"])
     table = table.sort_values("Skor", ascending=False).reset_index(drop=True)
-    st.dataframe(
+    render_marked_table(
         table,
-        column_config={
-            "Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f"),
-        },
-        hide_index=True,
-        use_container_width=True,
-        height=min(640, 60 + 36 * len(table)),
-    )
-    st.download_button(
-        "⬇️ Temel analiz tablosunu CSV indir",
-        csv_bytes(table),
-        "breakout_temel.csv",
-        "text/csv",
+        "tbl_fund",
+        market,
+        {"Skor": st.column_config.ProgressColumn("Skor", min_value=0, max_value=100, format="%.0f")},
+        file_name="breakout_temel.csv",
     )
     left, right = st.columns(2)
-    cap_col = "Piyasa Değeri (Mlr $)"
+    cap_col = "Piyasa Değeri (Mlr)"
     if cap_col in table.columns:
-        cap_fig = px.scatter(
-            table.dropna(subset=[cap_col]), x=cap_col, y="Skor", color="Sektör",
-            hover_name="Hisse", log_x=True, title="Piyasa Değeri – Skor",
-        )
-        left.plotly_chart(style_figure(cap_fig, 400), use_container_width=True)
+        cap_data = table.dropna(subset=[cap_col])
+        cap_data = cap_data[cap_data[cap_col] > 0]
+        if not cap_data.empty:
+            cap_fig = px.scatter(
+                cap_data, x=cap_col, y="Skor", color="Sektör",
+                hover_name="Hisse", log_x=True, title="Piyasa Değeri – Skor",
+            )
+            left.plotly_chart(style_figure(cap_fig, 400), use_container_width=True)
     if "F/K" in table.columns:
         pe_data = table[(table["F/K"] > 0) & (table["F/K"] < 100)]
         if not pe_data.empty:
@@ -1066,7 +1332,18 @@ def render_fundamental_tab(views):
             st.plotly_chart(style_figure(perf_fig, 420), use_container_width=True)
 
 
-def build_chart(df, engine, tf, ticker, view_bars):
+def market_rangebreaks(tf, mkt):
+    if tf in ("1h", "4h"):
+        return [
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[mkt["close_min"] / 60.0, mkt["open_min"] / 60.0], pattern="hour"),
+        ]
+    if tf == "1d":
+        return [dict(bounds=["sat", "mon"])]
+    return []
+
+
+def build_chart(df, engine, tf, ticker, view_bars, mkt):
     n = len(df)
     start = max(0, n - view_bars)
     view = df.iloc[start:]
@@ -1136,11 +1413,9 @@ def build_chart(df, engine, tf, ticker, view_bars):
     )
     fig.add_hline(y=70, line_dash="dot", line_color="gray", row=3, col=1)
     fig.add_hline(y=30, line_dash="dot", line_color="gray", row=3, col=1)
-    if tf in ("1h", "4h"):
-        breaks = [dict(bounds=["sat", "mon"]), dict(bounds=[16, 9.5], pattern="hour")]
+    breaks = market_rangebreaks(tf, mkt)
+    if breaks:
         fig.update_xaxes(rangebreaks=breaks)
-    elif tf == "1d":
-        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     fig.update_layout(
         template="plotly_dark",
         height=780,
@@ -1158,6 +1433,9 @@ def render_detail_tab(scan, views):
         st.info("Detay için eşleşen hisse yok.")
         return
     params = scan["params"]
+    market = params["market"]
+    mkt = MARKETS[market]
+    cur = mkt["currency"]
     col1, col2, col3 = st.columns([2, 1, 1])
     ticker = col1.selectbox(
         "Hisse", summary["Hisse"].tolist(),
@@ -1166,12 +1444,12 @@ def render_detail_tab(scan, views):
     tf = col2.selectbox("Zaman dilimi", params["tfs"], format_func=lambda x: TF_CONFIG[x]["label"])
     view_bars = col3.slider("Gösterilecek bar", 60, 400, 180, 10)
 
-    raw = fetch_history(ticker, tf)
+    raw = fetch_history(ticker, tf, market)
     if raw is None or raw.empty:
         st.warning("Bu hisse için fiyat verisi alınamadı.")
         return
     try:
-        df = prepare_frame(raw, tf, params["closed_only"])
+        df = prepare_frame(raw, tf, params["closed_only"], market)
         result = analyze_frame(df, params["length"], params["mult"], params["method"])
         if result is None:
             st.warning("Yeterli bar sayısı yok.")
@@ -1180,13 +1458,13 @@ def render_detail_tab(scan, views):
             df["High"].to_numpy(dtype=float), df["Low"].to_numpy(dtype=float),
             df["Close"].to_numpy(dtype=float), params["length"], params["mult"], params["method"],
         )
-        fig = build_chart(df, engine, tf, ticker, view_bars)
+        fig = build_chart(df, engine, tf, ticker, view_bars, mkt)
     except Exception as exc:
         st.error(f"Grafik oluşturulamadı: {exc}")
         return
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Son Fiyat", f"${result['close']:.2f}")
+    m1.metric("Son Fiyat", f"{cur}{result['close']:.2f}")
     m2.metric("Durum", "Long" if result["in_long"] else "Flat",
               f"{result['buy_ago']} bar önce Buy" if result["in_long"] and result["buy_ago"] < BIG_BARS else None)
     m3.metric("Skor", f"{result['skor']:.0f}/100")
@@ -1199,9 +1477,9 @@ def render_detail_tab(scan, views):
     if info is not None:
         st.markdown(f"**{info['description']}** · {info['sector']} · {info['industry']}")
         cards = [
-            ("Piyasa Değeri", f"${nz(info.get('market_cap_basic'), np.nan) / 1e9:.1f} Mlr"),
+            ("Piyasa Değeri", f"{cur}{nz(info.get('market_cap_basic'), np.nan) / 1e9:.1f} Mlr"),
             ("F/K", f"{nz(info.get('price_earnings_ttm'), np.nan):.1f}"),
-            ("HBK", f"${nz(info.get('earnings_per_share_diluted_ttm'), np.nan):.2f}"),
+            ("HBK", f"{cur}{nz(info.get('earnings_per_share_diluted_ttm'), np.nan):.2f}"),
             ("Temettü", f"{nz(info.get('dividends_yield_current'), 0.0):.2f}%"),
             ("Beta", f"{nz(info.get('beta_1_year'), np.nan):.2f}"),
             ("Analist", recommend_label(info.get("Recommend.All"))),
@@ -1213,7 +1491,7 @@ def render_detail_tab(scan, views):
     extra = pd.DataFrame(
         {
             "Gösterge": [
-                "Direnç çizgisi ($)", "Çizgiye mesafe %", "Eğim %/bar", "Sinyal getirisi %",
+                "Direnç çizgisi", "Çizgiye mesafe %", "Eğim %/bar", "Sinyal getirisi %",
                 "MACD histogram", "ATR %", "EMA 20", "EMA 50", "EMA 200", "EMA durumu", "Buy zamanı",
             ],
             "Değer": [
@@ -1234,6 +1512,397 @@ def render_detail_tab(scan, views):
     st.dataframe(extra, hide_index=True, use_container_width=True)
 
 
+def normalize_ticker(text, market):
+    mkt = MARKETS[market]
+    value = text.strip().upper()
+    if mkt["suffix"] and value.endswith(mkt["suffix"]):
+        value = value[: -len(mkt["suffix"])]
+    if mkt["dot_to_dash"]:
+        value = value.replace(".", "-")
+    if not re.match(r"^[A-Z][A-Z0-9\-]{0,9}$", value):
+        return ""
+    return value
+
+
+def run_backtest(df, engine, capital, commission_pct, slippage_pct, fractional):
+    n = len(df)
+    open_p = df["Open"].to_numpy(dtype=float)
+    close_p = df["Close"].to_numpy(dtype=float)
+    bull = engine["bull"]
+    bear = engine["bear"]
+    comm = commission_pct / 100.0
+    slip = slippage_pct / 100.0
+    cash = float(capital)
+    shares = 0.0
+    in_pos = False
+    entry_i = -1
+    entry_price = 0.0
+    entry_fee = 0.0
+    pending = 0
+    equity = np.zeros(n)
+    exposure = np.zeros(n, dtype=bool)
+    trades = []
+    for i in range(n):
+        if pending == 1 and not in_pos:
+            price = open_p[i] * (1.0 + slip)
+            qty = cash / (price * (1.0 + comm)) if price > 0 else 0.0
+            if not fractional:
+                qty = float(np.floor(qty))
+            if qty > 0:
+                cost = qty * price
+                fee = cost * comm
+                cash -= cost + fee
+                shares = qty
+                in_pos = True
+                entry_i = i
+                entry_price = price
+                entry_fee = fee
+        elif pending == -1 and in_pos:
+            price = open_p[i] * (1.0 - slip)
+            proceeds = shares * price
+            fee = proceeds * comm
+            cash += proceeds - fee
+            invested = shares * entry_price + entry_fee
+            pnl = proceeds - fee - invested
+            trades.append(
+                {
+                    "entry_i": entry_i, "exit_i": i, "entry_price": entry_price, "exit_price": price,
+                    "shares": shares, "pnl": pnl, "ret": pnl / invested * 100.0 if invested > 0 else 0.0,
+                    "bars": i - entry_i, "status": "Kapalı",
+                }
+            )
+            shares = 0.0
+            in_pos = False
+        equity[i] = cash + shares * close_p[i]
+        exposure[i] = in_pos
+        if bear[i]:
+            pending = -1
+        elif bull[i]:
+            pending = 1
+        else:
+            pending = 0
+    if in_pos:
+        mark = close_p[-1]
+        invested = shares * entry_price + entry_fee
+        pnl = shares * mark - invested
+        trades.append(
+            {
+                "entry_i": entry_i, "exit_i": n - 1, "entry_price": entry_price, "exit_price": float(mark),
+                "shares": shares, "pnl": pnl, "ret": pnl / invested * 100.0 if invested > 0 else 0.0,
+                "bars": n - 1 - entry_i, "status": "Açık",
+            }
+        )
+    return equity, exposure, trades, pending
+
+
+def build_trades_table(df, trades, tf):
+    fmt = "%Y-%m-%d %H:%M" if tf in ("1h", "4h") else "%Y-%m-%d"
+    rows = []
+    for number, trade in enumerate(trades, start=1):
+        rows.append(
+            {
+                "No": number,
+                "Giriş Zamanı": df.index[trade["entry_i"]].strftime(fmt),
+                "Çıkış Zamanı": df.index[trade["exit_i"]].strftime(fmt) if trade["status"] == "Kapalı" else "—",
+                "Giriş Fiyatı": trade["entry_price"],
+                "Çıkış / Son Fiyat": trade["exit_price"],
+                "Adet": trade["shares"],
+                "Bar": trade["bars"],
+                "Getiri %": trade["ret"],
+                "K/Z": trade["pnl"],
+                "Durum": trade["status"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def backtest_stats(df, equity, exposure, trades, capital):
+    final = float(equity[-1])
+    total_ret = (final / capital - 1.0) * 100.0
+    bh_ret = (float(df["Close"].iloc[-1]) / float(df["Open"].iloc[0]) - 1.0) * 100.0
+    peak = np.maximum.accumulate(equity)
+    drawdown = equity / peak - 1.0
+    max_dd = float(drawdown.min() * 100.0)
+    closed = [t for t in trades if t["status"] == "Kapalı"]
+    wins = [t for t in closed if t["pnl"] > 0]
+    losses = [t for t in closed if t["pnl"] <= 0]
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = -sum(t["pnl"] for t in losses)
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = float("nan")
+    all_returns = [t["ret"] for t in trades]
+    days = (df.index[-1] - df.index[0]).days
+    cagr = ((final / capital) ** (365.0 / days) - 1.0) * 100.0 if days >= 60 and final > 0 else float("nan")
+    return {
+        "capital": float(capital),
+        "final": final,
+        "total_ret": total_ret,
+        "bh_ret": bh_ret,
+        "max_dd": max_dd,
+        "trade_count": len(trades),
+        "closed_count": len(closed),
+        "win_rate": len(wins) / len(closed) * 100.0 if closed else float("nan"),
+        "profit_factor": profit_factor,
+        "avg_ret": float(np.mean(all_returns)) if all_returns else float("nan"),
+        "best": float(max(all_returns)) if all_returns else float("nan"),
+        "worst": float(min(all_returns)) if all_returns else float("nan"),
+        "exposure": float(exposure.mean() * 100.0),
+        "cagr": cagr,
+    }
+
+
+def execute_backtest(ticker, tf, period, market, params, capital, commission, slippage, fractional):
+    try:
+        raw = fetch_history_period(ticker, tf, market, period)
+        if raw is None or raw.empty:
+            return {"error": f"{ticker} için fiyat verisi alınamadı. Sembolü ve piyasa seçimini kontrol edin."}
+        df = prepare_frame(raw, tf, params["closed_only"], market)
+        if df is None or len(df) < max(2 * params["length"] + 40, 80):
+            return {"error": "Backtest için yeterli bar yok. Daha uzun bir veri aralığı seçin."}
+        engine = run_engine(
+            df["High"].to_numpy(dtype=float), df["Low"].to_numpy(dtype=float),
+            df["Close"].to_numpy(dtype=float), params["length"], params["mult"], params["method"],
+        )
+        equity, exposure, trades, pending = run_backtest(df, engine, capital, commission, slippage, fractional)
+        stats = backtest_stats(df, equity, exposure, trades, capital)
+        shares_bh = capital / float(df["Open"].iloc[0])
+        bh_equity = shares_bh * df["Close"].to_numpy(dtype=float)
+        fmt = "%Y-%m-%d %H:%M" if tf in ("1h", "4h") else "%Y-%m-%d"
+        return {
+            "ticker": ticker,
+            "tf": tf,
+            "market": market,
+            "period": period,
+            "df": df,
+            "engine": engine,
+            "equity": equity,
+            "bh_equity": bh_equity,
+            "trades": trades,
+            "trades_table": build_trades_table(df, trades, tf),
+            "stats": stats,
+            "pending": pending,
+            "first": df.index[0].strftime(fmt),
+            "last": df.index[-1].strftime(fmt),
+            "bars": len(df),
+            "pine": (params["length"], params["mult"], params["method"]),
+            "costs": (capital, commission, slippage, fractional),
+        }
+    except Exception as exc:
+        return {"error": f"Backtest hesaplanamadı: {exc}"}
+
+
+def build_backtest_chart(result):
+    df = result["df"]
+    trades = result["trades"]
+    equity = result["equity"]
+    bh_equity = result["bh_equity"]
+    tf = result["tf"]
+    mkt = MARKETS[result["market"]]
+    x = df.index
+    peak = np.maximum.accumulate(equity)
+    drawdown = (equity / peak - 1.0) * 100.0
+    fig = make_subplots(
+        rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.52, 0.30, 0.18]
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+            name="Fiyat", increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        ),
+        row=1, col=1,
+    )
+    if trades:
+        entry_x = [x[t["entry_i"]] for t in trades]
+        entry_y = [t["entry_price"] for t in trades]
+        fig.add_trace(
+            go.Scatter(x=entry_x, y=entry_y, mode="markers", name="Alım",
+                       marker=dict(symbol="triangle-up", size=12, color="#14b8a6", line=dict(width=1, color="white"))),
+            row=1, col=1,
+        )
+        closed = [t for t in trades if t["status"] == "Kapalı"]
+        if closed:
+            fig.add_trace(
+                go.Scatter(
+                    x=[x[t["exit_i"]] for t in closed], y=[t["exit_price"] for t in closed],
+                    mode="markers", name="Satım",
+                    marker=dict(symbol="triangle-down", size=12, color="#ef4444", line=dict(width=1, color="white")),
+                    text=[f"{t['ret']:+.2f}%" for t in closed], hovertemplate="%{y:.2f} (%{text})<extra>Satım</extra>",
+                ),
+                row=1, col=1,
+            )
+    fig.add_trace(
+        go.Scatter(x=x, y=equity, mode="lines", name="Strateji özsermaye", line=dict(color="#2dd4bf", width=2)),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=bh_equity, mode="lines", name="Al-Tut", line=dict(color="#fbbf24", width=1.5, dash="dot")),
+        row=2, col=1,
+    )
+    fig.add_trace(
+        go.Scatter(x=x, y=drawdown, mode="lines", name="Düşüş %", fill="tozeroy",
+                   line=dict(color="#f87171", width=1)),
+        row=3, col=1,
+    )
+    breaks = market_rangebreaks(tf, mkt)
+    if breaks:
+        fig.update_xaxes(rangebreaks=breaks)
+    fig.update_layout(
+        template="plotly_dark",
+        height=820,
+        xaxis_rangeslider_visible=False,
+        title=f"{result['ticker']} — {TF_CONFIG[tf]['label']} Backtest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(l=10, r=10, t=70, b=10),
+    )
+    return fig
+
+
+def fmt_value(value, pattern="{:.2f}", suffix=""):
+    number = nz(value, np.nan)
+    if np.isnan(number):
+        return "—"
+    if np.isinf(number):
+        return "∞"
+    return pattern.format(number) + suffix
+
+
+def render_backtest_result(result):
+    if "error" in result:
+        st.error(result["error"])
+        return
+    stats = result["stats"]
+    cur = MARKETS[result["market"]]["currency"]
+    capital, commission, slippage, fractional = result["costs"]
+    length, mult, method = result["pine"]
+    st.markdown(
+        f"**{result['ticker']}** · {TF_CONFIG[result['tf']]['label']} · veri: {result['first']} → {result['last']} "
+        f"({result['bars']} bar, istek: {result['period']})"
+    )
+    st.caption(
+        f"Pine: Swing={length}, Slope={mult}, Yöntem={method} · Sermaye {cur}{capital:,.0f} · "
+        f"Komisyon %{commission} · Kayma %{slippage} · {'Kesirli hisse' if fractional else 'Tam hisse'}"
+    )
+    row1 = st.columns(4)
+    row1[0].metric(
+        "Strateji Getirisi", f"{stats['total_ret']:.2f}%",
+        f"{stats['total_ret'] - stats['bh_ret']:+.2f} puan (Al-Tut'a göre)",
+    )
+    row1[1].metric("Al-Tut Getirisi", f"{stats['bh_ret']:.2f}%")
+    row1[2].metric(
+        "Son Sermaye", f"{cur}{stats['final']:,.2f}", f"{stats['final'] - stats['capital']:+,.2f}",
+    )
+    row1[3].metric("Maks. Düşüş", f"{stats['max_dd']:.2f}%")
+    row2 = st.columns(4)
+    row2[0].metric("İşlem Sayısı", f"{stats['trade_count']}")
+    row2[1].metric("Kazanma Oranı", fmt_value(stats["win_rate"], "{:.1f}", "%"))
+    row2[2].metric("Profit Factor", fmt_value(stats["profit_factor"]))
+    row2[3].metric("Ort. İşlem Getirisi", fmt_value(stats["avg_ret"], "{:.2f}", "%"))
+    row3 = st.columns(4)
+    row3[0].metric("En İyi İşlem", fmt_value(stats["best"], "{:.2f}", "%"))
+    row3[1].metric("En Kötü İşlem", fmt_value(stats["worst"], "{:.2f}", "%"))
+    row3[2].metric("Piyasada Kalma", f"{stats['exposure']:.1f}%")
+    row3[3].metric("Yıllık Getiri (CAGR)", fmt_value(stats["cagr"], "{:.2f}", "%"))
+    if result["pending"] == 1:
+        st.info("Son bar **Buy** sinyali verdi. İşlem bir sonraki barın açılışında gerçekleşir.")
+    elif result["pending"] == -1:
+        st.info("Son bar **Sell** sinyali verdi. Açık pozisyon varsa bir sonraki barın açılışında kapanır.")
+    if stats["trade_count"] == 0:
+        st.warning("Seçilen dönemde hiç işlem oluşmadı.")
+    st.plotly_chart(build_backtest_chart(result), use_container_width=True)
+    table = result["trades_table"]
+    if table.empty:
+        return
+    returns_fig = go.Figure(
+        go.Bar(
+            x=table["No"], y=table["Getiri %"],
+            marker_color=np.where(table["Getiri %"] >= 0, "#26a69a", "#ef5350"),
+            hovertemplate="İşlem %{x}: %{y:.2f}%<extra></extra>",
+        )
+    )
+    returns_fig.update_layout(title="İşlem Başına Getiri %", xaxis_title="İşlem No", yaxis_title="Getiri %")
+    st.plotly_chart(style_figure(returns_fig, 320), use_container_width=True)
+    st.markdown("##### İşlem Listesi")
+    st.dataframe(
+        table,
+        column_config={
+            "Giriş Fiyatı": st.column_config.NumberColumn(format="%.2f"),
+            "Çıkış / Son Fiyat": st.column_config.NumberColumn(format="%.2f"),
+            "Adet": st.column_config.NumberColumn(format="%.4f"),
+            "Getiri %": st.column_config.NumberColumn(format="%.2f"),
+            "K/Z": st.column_config.NumberColumn(format="%.2f"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        height=min(520, 60 + 36 * len(table)),
+    )
+    st.download_button(
+        "⬇️ İşlem listesini CSV indir",
+        csv_bytes(table),
+        f"backtest_{result['ticker']}_{result['tf']}.csv",
+        "text/csv",
+        key="bt_download",
+    )
+
+
+def render_backtest_tab(scan, views, params):
+    market = params["market"]
+    mkt = MARKETS[market]
+    st.markdown(
+        "Seçilen hisse için LuxAlgo **Trendlines with Breaks** stratejisi (Long Only) geçmişte uygulanmış olsaydı "
+        "sonuç ne olurdu? Sinyal bar kapanışında oluşur, işlem sonraki barın açılışında gerçekleşir."
+    )
+    options = []
+    labels = {}
+    if scan is not None and scan["params"]["market"] == market:
+        uni = scan["uni"]
+        priority = views["summary"]["Hisse"].tolist() if views is not None and not views["summary"].empty else []
+        rest = [t for t in uni["ticker"].tolist() if t not in priority]
+        options = priority + rest
+        labels = dict(zip(uni["ticker"], uni["description"]))
+    col1, col2, col3 = st.columns([2, 1, 1])
+    picked = None
+    if options:
+        picked = col1.selectbox(
+            "Hisse (filtre sonuçları üstte)", options,
+            format_func=lambda t: f"{t} — {labels.get(t, t)}", key="bt_ticker",
+        )
+    manual = col1.text_input(
+        "veya sembol yazın (örn. AAPL, THYAO)", key="bt_manual",
+        help="Doluysa listedeki seçimin yerine geçer.",
+    )
+    tf = col2.selectbox("Zaman dilimi", TF_ORDER, index=2, format_func=lambda x: TF_CONFIG[x]["label"], key="bt_tf")
+    period = col3.selectbox("Geçmiş veri", BT_PERIODS[tf], index=min(1, len(BT_PERIODS[tf]) - 1), key=f"bt_period_{tf}")
+    c1, c2, c3, c4 = st.columns(4)
+    capital = c1.number_input(f"Başlangıç sermayesi ({mkt['currency']})", 100.0, 1_000_000_000.0, 1000.0, 100.0, key="bt_capital")
+    commission = c2.number_input("Komisyon % (her işlem yönü)", 0.0, 5.0, 0.04, 0.01, key="bt_commission")
+    slippage = c3.number_input("Kayma % (her işlem yönü)", 0.0, 5.0, 0.0, 0.01, key="bt_slippage")
+    fractional = c4.checkbox("Kesirli hisse", value=True, key="bt_fractional")
+    st.caption(
+        f"Pine parametreleri sol menüden alınır: Swing={params['length']}, Slope={params['mult']}, "
+        f"Yöntem={params['method']}, Yalnızca kapanmış barlar={'Evet' if params['closed_only'] else 'Hayır'}"
+    )
+    if st.button("▶️ Backtest'i Çalıştır", type="primary", key="bt_run"):
+        ticker = normalize_ticker(manual, market) if manual.strip() else picked
+        if not ticker:
+            st.error("Geçerli bir hisse seçin veya sembol yazın.")
+        else:
+            with st.spinner(f"{ticker} için backtest hesaplanıyor..."):
+                st.session_state["bt_result"] = execute_backtest(
+                    ticker, tf, period, market, params, float(capital), float(commission), float(slippage), bool(fractional),
+                )
+    result = st.session_state.get("bt_result")
+    if result is not None:
+        render_backtest_result(result)
+    st.caption(
+        "Backtest sonuçları geçmiş performansı gösterir, gelecekteki getiriyi garanti etmez. "
+        "TradingView strateji test sonuçlarından küçük farklar olabilir."
+    )
+
+
 def render_method_tab():
     st.markdown(
         """
@@ -1247,10 +1916,32 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 - **Buy (B):** Üst trend çizgisi yukarı kırıldığında (`upos` 0 → 1) oluşur.
 - **Sell (S):** Alt trend çizgisi aşağı kırıldığında (`dnos` 0 → 1) oluşur ve açık Long kapanır.
 
+### Piyasalar
+
+| Piyasa | Hisse listesi | Fiyat verisi | Seans |
+|---|---|---|---|
+| Amerika | TradingView `america` (NASDAQ, NYSE) | `yfinance` (sembol) | 09:30–16:00 ET |
+| Türkiye | TradingView `turkey` (BIST) | `yfinance` (`.IS` eki) | 10:00–18:00 TRT |
+
+4 saatlik mumlar seansa göre iki parçaya bölünür: ABD 09:30–13:30 / 13:30–16:00, BIST 10:00–14:00 / 14:00–18:00.
+
 ### Sinyal Modları
 
 - **Taze Buy:** Son Buy sinyali son N bar içinde ve sonrasında Sell sinyali yok.
 - **Aktif Long:** Son sinyal Buy, henüz Sell sinyali oluşmamış.
+
+### Tablolar: Filtreleme ve İşaretleme
+
+- Her tabloda **🔎 Tablo filtreleri ve sıralama** bölümü vardır: metin arama, istediğiniz sütunlar için aralık veya çoklu seçim filtresi, sıralama. Filtreler birlikte (VE mantığıyla) uygulanır.
+- Satırların solundaki kutularla seçip **🟢 Yeşil / 🟡 Sarı / 🔴 Kırmızı** düğmeleriyle işaretleyin. Satırlar renklenir. "İşaret" sütunu da filtrelenebilir.
+- İşaretler tüm tablolarda ortaktır. Sol menüden CSV olarak indirilip yüklenebilir.
+
+### Backtest
+
+- Long Only strateji: Buy sinyalinde alım, Sell sinyalinde satım. Sinyal bar kapanışında oluşur, işlem sonraki barın açılışında gerçekleşir.
+- Sermayenin tamamı kullanılır, komisyon (varsayılan %0.04) ve isteğe bağlı kayma her işlem yönünde uygulanır.
+- Özsermaye her barın kapanışına göre hesaplanır. Maks. düşüş bu eğriden bulunur.
+- Al-Tut: veri setinin ilk barının açılışından son barın kapanışına.
 
 ### Breakout Skoru (0–100)
 
@@ -1267,7 +1958,6 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 
 ### Notlar
 
-- 4 saatlik mumlar 1 saatlik veriden New York seansına göre üretilir.
 - "Yalnızca kapanmış barlar" açıkken oluşmakta olan bar hesaplamaya katılmaz.
 - Veriler `yfinance` kaynaklıdır ve gecikmeli olabilir. Bu uygulama yatırım tavsiyesi değildir.
         """
@@ -1277,9 +1967,10 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 def render_welcome():
     st.markdown(
         """
-        Sol menüden evreni, zaman dilimlerini ve Pine parametrelerini seçip **🚀 Taramayı Başlat** düğmesine basın.
+        Sol menüden **piyasayı** (Amerika veya Türkiye BIST), evreni, zaman dilimlerini ve Pine parametrelerini seçip
+        **🚀 Taramayı Başlat** düğmesine basın.
 
-        Uygulama, TradingView Scanner üzerinden NASDAQ ve NYSE hisselerini alır, `yfinance` ile fiyat verilerini çeker
+        Uygulama, TradingView Scanner üzerinden hisse listesini alır, `yfinance` ile fiyat verilerini çeker
         ve LuxAlgo *Trendlines with Breaks* mantığıyla **Buy** sinyalindeki hisseleri bulur.
         """
     )
@@ -1289,7 +1980,6 @@ def render_welcome():
 def main():
     inject_css()
     st.title("📈 Breakout Screener")
-    st.caption("NASDAQ • NYSE | LuxAlgo Trendlines with Breaks | 1h · 4h · 1d · 1w")
 
     params, flt, run, clear = sidebar_controls()
 
@@ -1308,11 +1998,19 @@ def main():
 
     scan = st.session_state.get("scan")
     if scan is None:
+        st.caption("LuxAlgo Trendlines with Breaks | 1h · 4h · 1d · 1w")
         render_welcome()
+        st.markdown("---")
+        st.subheader("🧪 Hızlı Backtest")
+        render_backtest_tab(None, None, params)
         return
 
+    scan_market = scan["params"]["market"]
+    scan_mkt = MARKETS[scan_market]
+    st.caption(f"{scan_mkt['label']} | LuxAlgo Trendlines with Breaks | 1h · 4h · 1d · 1w")
+
     if scan["params"] != params:
-        st.warning("Sol menüdeki evren / Pine ayarları son taramadan farklı. Yeni ayarlar için taramayı yeniden başlatın.")
+        st.warning("Sol menüdeki piyasa / evren / Pine ayarları son taramadan farklı. Yeni ayarlar için taramayı yeniden başlatın.")
 
     views = compute_views(scan, flt)
     if views is None:
@@ -1328,20 +2026,25 @@ def main():
     c4.metric("Tüm TF Uyumlu", f"{int((summary['Uyum'] == len(tfs)).sum()) if not summary.empty else 0}")
     c5.metric("Son Tarama", scan["time"])
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-        ["🎯 Sonuçlar", "📋 Sinyal Detayları", "📊 Görselleştirme", "🏦 Temel Analiz", "🔍 Hisse Detay", "ℹ️ Metodoloji"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+        [
+            "🎯 Sonuçlar", "📋 Sinyal Detayları", "📊 Görselleştirme", "🏦 Temel Analiz",
+            "🔍 Hisse Detay", "🧪 Backtest", "ℹ️ Metodoloji",
+        ]
     )
     with tab1:
-        render_summary_tab(views, tfs)
+        render_summary_tab(views, tfs, scan_market)
     with tab2:
-        render_detail_table_tab(views)
+        render_detail_table_tab(views, scan_market)
     with tab3:
         render_visual_tab(views, tfs)
     with tab4:
-        render_fundamental_tab(views)
+        render_fundamental_tab(views, scan_market)
     with tab5:
         render_detail_tab(scan, views)
     with tab6:
+        render_backtest_tab(scan, views, params)
+    with tab7:
         render_method_tab()
 
 
