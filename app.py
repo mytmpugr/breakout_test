@@ -1,5 +1,7 @@
+import json
 import re
 import time
+from urllib.parse import quote
 
 import numpy as np
 import pandas as pd
@@ -7,6 +9,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 from requests.adapters import HTTPAdapter
@@ -21,6 +24,7 @@ st.set_page_config(
 
 BIG_BARS = 10**6
 BATCH_SIZE = 60
+TV_CHART_URL = "https://www.tradingview.com/chart/?symbol="
 
 SIGNAL_FRESH = "fresh"
 SIGNAL_ACTIVE = "active"
@@ -35,6 +39,16 @@ SIGNAL_SHORT = {
     SIGNAL_FRESH: "Yeni Buy",
     SIGNAL_ACTIVE: "Aktif Long",
     SIGNAL_APPROACH: "Yaklaşan",
+}
+
+RANK_METRICS = {
+    "Strateji getirisi %": "total_ret",
+    "Al-Tut'a göre fark (puan)": "excess",
+    "Getiri / Maks. düşüş": "ret_dd",
+    "Profit Factor": "profit_factor",
+    "Kazanma oranı %": "win_rate",
+    "Maks. düşüş (en az düşüş)": "max_dd",
+    "Yıllık getiri (CAGR) %": "cagr",
 }
 
 NO_MARK = "—"
@@ -131,6 +145,71 @@ FUND_LABELS = {
     "Perf.Y": "1Y Perf %",
 }
 
+TV_DBLCLICK_JS = """
+<script>
+(function () {
+  var P = window.parent;
+  if (!P || !P.document) { return; }
+  P.__tvMap = __MAP__;
+  if (P.__tvDblBound) { return; }
+  P.__tvDblBound = true;
+  var HEADER_H = 35;
+  var ROW_H = 35;
+
+  function openTicker(ticker) {
+    var map = P.__tvMap || {};
+    var symbol = map[ticker];
+    if (!symbol) { return false; }
+    P.open("https://www.tradingview.com/chart/?symbol=" + encodeURIComponent(symbol), "_blank", "noopener");
+    return true;
+  }
+
+  function tickerColumn(grid) {
+    var heads = grid.querySelectorAll('th[role="columnheader"]');
+    for (var i = 0; i < heads.length; i++) {
+      if ((heads[i].textContent || "").trim() === "Hisse") {
+        return heads[i].getAttribute("aria-colindex");
+      }
+    }
+    return null;
+  }
+
+  function tickerFromRow(grid, row) {
+    var col = tickerColumn(grid);
+    if (!col || !row) { return null; }
+    var cell = row.querySelector('td[aria-colindex="' + col + '"]');
+    return cell ? (cell.textContent || "").trim() : null;
+  }
+
+  P.document.addEventListener("dblclick", function (ev) {
+    var target = ev.target;
+    if (!target || !target.closest) { return; }
+    var frame = target.closest('[data-testid="stDataFrame"]');
+    if (!frame) { return; }
+    var grid = frame.querySelector('table[role="grid"]');
+    if (!grid) { return; }
+    var ticker = null;
+    var canvas = frame.querySelector("canvas");
+    var scroller = frame.querySelector(".dvn-scroller");
+    if (canvas && scroller) {
+      var rect = canvas.getBoundingClientRect();
+      var y = ev.clientY - rect.top + scroller.scrollTop - HEADER_H;
+      if (y >= 0) {
+        var index = Math.floor(y / ROW_H);
+        var row = grid.querySelector('tr[row-index="' + index + '"]');
+        ticker = tickerFromRow(grid, row);
+      }
+    }
+    if (!ticker || !(P.__tvMap || {})[ticker]) {
+      var selected = grid.querySelector('tr[aria-selected="true"]');
+      ticker = tickerFromRow(grid, selected);
+    }
+    if (ticker) { openTicker(ticker); }
+  }, true);
+})();
+</script>
+"""
+
 
 def inject_css():
     st.markdown(
@@ -157,6 +236,38 @@ def nz(value, default=0.0):
     if np.isnan(number) or np.isinf(number):
         return float(default)
     return number
+
+
+def build_tv_map(scan):
+    mapping = {}
+    if scan is None:
+        return mapping
+    uni = scan["uni"]
+    if "tv_symbol" not in uni.columns:
+        return mapping
+    for ticker, symbol in zip(uni["ticker"], uni["tv_symbol"]):
+        if isinstance(symbol, str) and ":" in symbol:
+            mapping[str(ticker)] = symbol
+    return mapping
+
+
+def tv_symbol_for(ticker, market):
+    mapping = st.session_state.get("tv_map", {})
+    symbol = mapping.get(ticker)
+    if symbol:
+        return symbol
+    if market == "tr":
+        return f"BIST:{ticker}"
+    return ticker.replace("-", ".")
+
+
+def tv_url(ticker, market):
+    return TV_CHART_URL + quote(tv_symbol_for(ticker, market), safe="")
+
+
+def inject_tv_dblclick(tv_map):
+    script = TV_DBLCLICK_JS.replace("__MAP__", json.dumps(tv_map))
+    components.html(script, height=0)
 
 
 @st.cache_resource(show_spinner=False)
@@ -189,7 +300,7 @@ def get_http_session():
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_universe(market, limit, min_cap, min_price, min_volume):
     mkt_config = MARKETS[market]
-    tv_url = f"https://scanner.tradingview.com/{mkt_config['tv_market']}/scan"
+    tv_scan_url = f"https://scanner.tradingview.com/{mkt_config['tv_market']}/scan"
     session = get_http_session()
     filters = [
         {"left": "type", "operation": "equal", "right": "stock"},
@@ -212,7 +323,7 @@ def fetch_universe(market, limit, min_cap, min_price, min_volume):
             "range": [0, int(limit)],
         }
         try:
-            response = session.post(tv_url, json=payload, timeout=25)
+            response = session.post(tv_scan_url, json=payload, timeout=25)
             if response.status_code != 200:
                 last_error = f"TradingView Scanner HTTP {response.status_code}"
                 continue
@@ -1153,7 +1264,8 @@ def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file
     filtered = table_filters(work, key).reset_index(drop=True)
     st.caption(
         f"Gösterilen satır: {len(filtered)} / {len(work)}   ·   🟢 Yeşil   🟡 Sarı   🔴 Kırmızı   "
-        "(satırların solundaki kutularla seçip aşağıdaki düğmelerle işaretleyin)"
+        "(satırların solundaki kutularla seçip aşağıdaki düğmelerle işaretleyin)   ·   "
+        "📈 Bir satıra çift tıklayınca TradingView'de açılır"
     )
     if filtered.empty:
         st.info("Filtrelerle eşleşen satır yok.")
@@ -1172,7 +1284,7 @@ def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file
         key=f"{key}_df_{get_nonce(key)}_{row_signature}",
     )
     try:
-        selected_rows = list(event.selection.rows)
+        selected_rows = [int(r) for r in event.selection.rows if int(r) < len(filtered)]
     except Exception:
         selected_rows = []
     scope = st.radio(
@@ -1208,6 +1320,9 @@ def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file
         key=f"{key}_download",
         use_container_width=True,
     )
+    if selected_rows:
+        first_ticker = str(filtered.iloc[selected_rows[0]][ticker_col])
+        st.link_button(f"📈 {first_ticker} — TradingView'de aç", tv_url(first_ticker, market))
 
 
 def render_summary_tab(views, tfs, market):
@@ -1591,6 +1706,7 @@ def render_detail_tab(scan, views):
         }
     )
     st.dataframe(extra, hide_index=True, use_container_width=True)
+    st.link_button(f"📈 {ticker} — TradingView'de aç", tv_url(ticker, market))
 
 
 def normalize_ticker(text, market):
@@ -1774,6 +1890,222 @@ def execute_backtest(ticker, tf, period, market, params, capital, commission, sl
         }
     except Exception as exc:
         return {"error": f"Backtest hesaplanamadı: {exc}"}
+
+
+@st.cache_data(ttl=300, show_spinner=False, max_entries=16)
+def batch_backtest(tickers, tf, period, market, length, mult, method, closed_only,
+                   capital, commission, slippage, fractional):
+    cfg = TF_CONFIG[tf]
+    suffix = MARKETS[market]["suffix"]
+    min_bars = max(2 * length + 40, 80)
+    rows = []
+    failed = 0
+    for start in range(0, len(tickers), BATCH_SIZE):
+        chunk = tickers[start : start + BATCH_SIZE]
+        frames = download_batch(tuple(t + suffix for t in chunk), cfg["interval"], period)
+        for ticker in chunk:
+            raw = frames.get(ticker + suffix)
+            if raw is None or raw.empty:
+                failed += 1
+                continue
+            try:
+                df = prepare_frame(raw, tf, closed_only, market)
+                if df is None or len(df) < min_bars:
+                    failed += 1
+                    continue
+                engine = run_engine(
+                    df["High"].to_numpy(dtype=float), df["Low"].to_numpy(dtype=float),
+                    df["Close"].to_numpy(dtype=float), length, mult, method,
+                )
+                equity, exposure, trades, pending = run_backtest(
+                    df, engine, capital, commission, slippage, fractional
+                )
+                stats = backtest_stats(df, equity, exposure, trades, capital)
+            except Exception:
+                failed += 1
+                continue
+            profit_factor = stats["profit_factor"]
+            if isinstance(profit_factor, float) and np.isinf(profit_factor):
+                profit_factor = 99.99
+            ret_dd = stats["total_ret"] / abs(stats["max_dd"]) if stats["max_dd"] < -0.0001 else float("nan")
+            has_open = bool(trades) and trades[-1]["status"] == "Açık"
+            if has_open and pending == -1:
+                state = "Açık pozisyon · Sell sinyali"
+            elif has_open:
+                state = "Açık pozisyon"
+            elif pending == 1:
+                state = "Yeni Buy (sonraki bar alım)"
+            else:
+                state = "Pozisyon yok"
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "total_ret": stats["total_ret"],
+                    "bh_ret": stats["bh_ret"],
+                    "excess": stats["total_ret"] - stats["bh_ret"],
+                    "max_dd": stats["max_dd"],
+                    "ret_dd": ret_dd,
+                    "trade_count": stats["trade_count"],
+                    "win_rate": stats["win_rate"],
+                    "profit_factor": profit_factor,
+                    "avg_ret": stats["avg_ret"],
+                    "exposure": stats["exposure"],
+                    "cagr": stats["cagr"],
+                    "state": state,
+                }
+            )
+    return rows, failed
+
+
+def rank_row_style(row):
+    css = MARK_CSS["green"] if row["Sıra"] <= 3 else ""
+    return [css] * len(row)
+
+
+def render_backtest_ranking(scan, views, params, tf, period, capital, commission, slippage, fractional):
+    if scan is None or views is None:
+        return
+    st.markdown("---")
+    st.markdown("##### 🏆 Otomatik Toplu Backtest — Filtre Sonuçları")
+    summary = views["summary"]
+    if summary.empty:
+        st.info("Filtre sonuçlarında hisse yok. Önce sol menüdeki sinyal filtrelerini gevşetin.")
+        return
+    market = scan["params"]["market"]
+    c1, c2, c3, c4 = st.columns([1.5, 1, 1.2, 1])
+    auto = c1.checkbox("Filtre sonuçlarını otomatik backtest'e al", value=True, key="bt_auto")
+    max_n = c2.slider("En fazla hisse", 5, 100, 30, 5, key="bt_max_n")
+    rank_label = c3.selectbox("Sıralama ölçütü", list(RANK_METRICS.keys()), key="bt_rank_metric")
+    min_trades = c4.number_input("Min. işlem sayısı", 0, 100, 1, 1, key="bt_min_trades")
+
+    tickers = tuple(summary["Hisse"].head(int(max_n)).tolist())
+    signature = (
+        tickers, tf, period, market, params["length"], params["mult"], params["method"],
+        params["closed_only"], capital, commission, slippage, fractional,
+    )
+    store = st.session_state.get("bt_batch")
+    run_now = auto and (store is None or store["sig"] != signature)
+    if not auto:
+        if st.button("▶️ Toplu Backtest'i Çalıştır", key="bt_batch_run"):
+            run_now = True
+    if run_now:
+        with st.spinner(f"{len(tickers)} hisse için {TF_CONFIG[tf]['label']} backtest hesaplanıyor..."):
+            rows, failed = batch_backtest(
+                tickers, tf, period, market, params["length"], params["mult"], params["method"],
+                params["closed_only"], capital, commission, slippage, fractional,
+            )
+        store = {"sig": signature, "rows": rows, "failed": failed}
+        st.session_state["bt_batch"] = store
+    if store is None:
+        st.info("Otomatik mod kapalı. Toplu backtest için düğmeye basın.")
+        return
+    if store["sig"] != signature:
+        st.warning("Gösterilen sıralama önceki ayarlara aittir. Güncellemek için düğmeye basın veya otomatik modu açın.")
+    if not store["rows"]:
+        st.warning("Hiçbir hisse için backtest hesaplanamadı. Veri aralığını veya zaman dilimini değiştirin.")
+        return
+
+    result_df = pd.DataFrame(store["rows"])
+    names = dict(zip(scan["uni"]["ticker"], scan["uni"]["description"]))
+    result_df["name"] = result_df["ticker"].map(names).fillna(result_df["ticker"])
+    result_df = result_df[result_df["trade_count"] >= int(min_trades)]
+    if result_df.empty:
+        st.info("Min. işlem sayısı koşulunu sağlayan hisse yok. Değeri düşürün.")
+        return
+    metric_col = RANK_METRICS[rank_label]
+    result_df[metric_col] = pd.to_numeric(result_df[metric_col], errors="coerce")
+    result_df = result_df.sort_values(metric_col, ascending=False, na_position="last").reset_index(drop=True)
+
+    table = pd.DataFrame(
+        {
+            "Sıra": np.arange(1, len(result_df) + 1),
+            "Hisse": result_df["ticker"],
+            "Şirket": result_df["name"],
+            "Strateji Getirisi %": result_df["total_ret"],
+            "Al-Tut %": result_df["bh_ret"],
+            "Fark (puan)": result_df["excess"],
+            "Maks. Düşüş %": result_df["max_dd"],
+            "Getiri/Düşüş": result_df["ret_dd"],
+            "İşlem": result_df["trade_count"],
+            "Kazanma %": result_df["win_rate"],
+            "Profit Factor": result_df["profit_factor"],
+            "Ort. İşlem %": result_df["avg_ret"],
+            "Piyasada %": result_df["exposure"],
+            "CAGR %": result_df["cagr"],
+            "Durum": result_df["state"],
+        }
+    )
+
+    best = result_df.iloc[0]
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Backtest Edilen", f"{len(result_df)} / {len(tickers)}")
+    m2.metric("En İyi", f"{best['ticker']}", f"{best[metric_col]:.2f}" if pd.notna(best[metric_col]) else None)
+    m3.metric("Ort. Strateji Getirisi", f"{result_df['total_ret'].mean():.2f}%")
+    m4.metric("Al-Tut'u Geçen", f"{int((result_df['excess'] > 0).sum())} / {len(result_df)}")
+    if store["failed"]:
+        st.caption(f"Veri alınamayan veya yetersiz barlı hisse sayısı: {store['failed']}")
+
+    top_n = result_df.head(20).iloc[::-1]
+    bar_values = top_n[metric_col].fillna(0.0)
+    rank_fig = go.Figure(
+        go.Bar(
+            x=bar_values, y=top_n["ticker"], orientation="h",
+            marker_color=np.where(bar_values >= 0, "#26a69a", "#ef5350"),
+            hovertemplate="%{y}: %{x:.2f}<extra></extra>",
+        )
+    )
+    rank_fig.update_layout(title=f"İlk 20 — {rank_label}")
+    st.plotly_chart(style_figure(rank_fig, 520), use_container_width=True)
+
+    config = {
+        "Sıra": st.column_config.NumberColumn(format="%d", width="small"),
+        "Hisse": st.column_config.TextColumn("Hisse", width="small"),
+        "Strateji Getirisi %": st.column_config.NumberColumn(format="%.2f"),
+        "Al-Tut %": st.column_config.NumberColumn(format="%.2f"),
+        "Fark (puan)": st.column_config.NumberColumn(format="%.2f"),
+        "Maks. Düşüş %": st.column_config.NumberColumn(format="%.2f"),
+        "Getiri/Düşüş": st.column_config.NumberColumn(format="%.2f"),
+        "İşlem": st.column_config.NumberColumn(format="%d"),
+        "Kazanma %": st.column_config.NumberColumn(format="%.1f"),
+        "Profit Factor": st.column_config.NumberColumn(format="%.2f"),
+        "Ort. İşlem %": st.column_config.NumberColumn(format="%.2f"),
+        "Piyasada %": st.column_config.NumberColumn(format="%.1f"),
+        "CAGR %": st.column_config.NumberColumn(format="%.2f"),
+    }
+    st.caption("İlk 3 hisse yeşil işaretlidir. Bir satıra çift tıklayınca TradingView'de açılır, tek tıklayınca seçilir.")
+    event = st.dataframe(
+        table.replace([np.inf, -np.inf], np.nan).style.apply(rank_row_style, axis=1),
+        column_config=config,
+        hide_index=True,
+        use_container_width=True,
+        height=min(720, 60 + 36 * len(table)),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"bt_rank_df_{abs(hash((signature, rank_label, int(min_trades)))) % 10**8}",
+    )
+    try:
+        selected = [int(r) for r in event.selection.rows if int(r) < len(table)]
+    except Exception:
+        selected = []
+    if selected:
+        chosen = str(table.iloc[selected[0]]["Hisse"])
+        b1, b2 = st.columns(2)
+        if b1.button(f"🔍 {chosen} için detaylı backtest'i göster", key="bt_rank_detail"):
+            with st.spinner(f"{chosen} için detaylı backtest hesaplanıyor..."):
+                st.session_state["bt_result"] = execute_backtest(
+                    chosen, tf, period, market, params, capital, commission, slippage, fractional,
+                )
+            st.success("Detaylı sonuç aşağıdaki 'Tek Hisse Backtest' bölümünde gösterilir.")
+        b2.link_button(f"📈 {chosen} — TradingView'de aç", tv_url(chosen, market))
+    else:
+        st.caption("Satıra tıklayıp seçin: detaylı backtest ve TradingView seçenekleri görünür.")
+    st.download_button(
+        "⬇️ Sıralamayı CSV indir",
+        csv_bytes(table),
+        "backtest_siralama.csv",
+        "text/csv",
+        key="bt_rank_download",
+    )
 
 
 def build_backtest_chart(result):
@@ -1966,6 +2298,12 @@ def render_backtest_tab(scan, views, params):
         f"Pine parametreleri sol menüden alınır: Swing={params['length']}, Slope={params['mult']}, "
         f"Yöntem={params['method']}, Yalnızca kapanmış barlar={'Evet' if params['closed_only'] else 'Hayır'}"
     )
+    render_backtest_ranking(
+        scan, views, params, tf, period, float(capital), float(commission), float(slippage), bool(fractional),
+    )
+    if scan is not None:
+        st.markdown("---")
+        st.markdown("##### 🔬 Tek Hisse Backtest")
     if st.button("▶️ Backtest'i Çalıştır", type="primary", key="bt_run"):
         ticker = normalize_ticker(manual, market) if manual.strip() else picked
         if not ticker:
@@ -2014,11 +2352,12 @@ Strateji, LuxAlgo **Trendlines with Breaks** göstergesinin Long Only dönüşü
 
 Birden fazla tür seçilirse bunlardan birini sağlayan hisse listelenir. Yaklaşan hisselerde kırılım henüz gerçekleşmemiştir ve gerçekleşeceğinin garantisi yoktur.
 
-### Tablolar: Filtreleme ve İşaretleme
+### Tablolar: Filtreleme, İşaretleme ve TradingView
 
 - Her tabloda **🔎 Tablo filtreleri ve sıralama** bölümü vardır: metin arama, istediğiniz sütunlar için aralık veya çoklu seçim filtresi, sıralama. Filtreler birlikte (VE mantığıyla) uygulanır.
 - Satırların solundaki kutularla seçip **🟢 Yeşil / 🟡 Sarı / 🔴 Kırmızı** düğmeleriyle işaretleyin. Satırlar renklenir. "İşaret" sütunu da filtrelenebilir.
 - İşaretler tüm tablolarda ortaktır. Sol menüden CSV olarak indirilip yüklenebilir.
+- **Bir satıra çift tıklayınca** hissenin TradingView grafiği yeni sekmede açılır (doğru borsa koduyla: `NASDAQ:`, `NYSE:`, `BIST:`). Tarayıcı açılır pencereleri engellerse izin verin. Satır seçilince çıkan **📈 TradingView'de aç** düğmesi yedek yoldur.
 
 ### Backtest
 
@@ -2026,6 +2365,14 @@ Birden fazla tür seçilirse bunlardan birini sağlayan hisse listelenir. Yakla�
 - Sermayenin tamamı kullanılır, komisyon (varsayılan %0.04) ve isteğe bağlı kayma her işlem yönünde uygulanır.
 - Özsermaye her barın kapanışına göre hesaplanır. Maks. düşüş bu eğriden bulunur.
 - Al-Tut: veri setinin ilk barının açılışından son barın kapanışına.
+
+### Otomatik Toplu Backtest
+
+- Filtreden çıkan hisseler (en fazla 100) sekmedeki zaman dilimi, veri uzunluğu ve maliyet ayarlarıyla otomatik olarak backtest'e alınır.
+- Sonuçlar seçtiğiniz ölçüte göre sıralanır: strateji getirisi, Al-Tut'a göre fark, getiri/maks. düşüş, Profit Factor, kazanma oranı, maks. düşüş (en az düşüş) veya CAGR.
+- "Min. işlem sayısı" ile hiç işlem yapmayan hisseler elenir. Profit Factor sonsuz çıkarsa 99.99 olarak gösterilir.
+- Tabloda bir hisse seçip detaylı backtest'i veya TradingView'i açabilirsiniz.
+- Sıralama geçmiş veriye dayanır ve aşırı uyum riski taşır. Gelecek performansı garanti etmez.
 
 ### Breakout Skoru (0–100)
 
@@ -2072,6 +2419,7 @@ def main():
     if clear:
         st.cache_data.clear()
         st.session_state.pop("scan", None)
+        st.session_state.pop("bt_batch", None)
         st.toast("Önbellek temizlendi.")
 
     if run:
@@ -2102,6 +2450,9 @@ def main():
     if views is None:
         st.error("Tarama sonucu boş.")
         return
+
+    tv_map = build_tv_map(scan)
+    st.session_state["tv_map"] = tv_map
 
     summary = views["summary"]
     matched = views["matched"]
@@ -2135,6 +2486,8 @@ def main():
         render_backtest_tab(scan, views, params)
     with tab7:
         render_method_tab()
+
+    inject_tv_dblclick(tv_map)
 
 
 main()
