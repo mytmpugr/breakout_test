@@ -25,6 +25,7 @@ st.set_page_config(
 BIG_BARS = 10**6
 BATCH_SIZE = 60
 TV_CHART_URL = "https://www.tradingview.com/chart/?symbol="
+TV_INTERVALS = {"1h": "60", "4h": "240", "1d": "D", "1w": "W"}
 
 SIGNAL_FRESH = "fresh"
 SIGNAL_ACTIVE = "active"
@@ -49,6 +50,12 @@ RANK_METRICS = {
     "Kazanma oranı %": "win_rate",
     "Maks. düşüş (en az düşüş)": "max_dd",
     "Yıllık getiri (CAGR) %": "cagr",
+}
+
+AUTO_PERIOD_MODES = {
+    "Otomatik (önerilen)": {"1h": "1y", "4h": "1y", "1d": "5y", "1w": "10y"},
+    "Kısa": {"1h": "3mo", "4h": "3mo", "1d": "2y", "1w": "5y"},
+    "Uzun": {"1h": "1y", "4h": "1y", "1d": "max", "1w": "max"},
 }
 
 NO_MARK = "—"
@@ -100,6 +107,7 @@ TF_CONFIG = {
     "1d": {"interval": "1d", "period": "2y", "label": "1 Gün"},
     "1w": {"interval": "1wk", "period": "10y", "label": "1 Hafta"},
 }
+TF_LABEL_TO_KEY = {cfg["label"]: key for key, cfg in TF_CONFIG.items()}
 BT_PERIODS = {
     "1h": ["3mo", "6mo", "1y"],
     "4h": ["3mo", "6mo", "1y"],
@@ -145,67 +153,191 @@ FUND_LABELS = {
     "Perf.Y": "1Y Perf %",
 }
 
-TV_DBLCLICK_JS = """
-<script>
-(function () {
-  var P = window.parent;
-  if (!P || !P.document) { return; }
-  P.__tvMap = __MAP__;
-  if (P.__tvDblBound) { return; }
-  P.__tvDblBound = true;
-  var HEADER_H = 35;
-  var ROW_H = 35;
+TV_HANDLER_JS = r"""
+function (W) {
+  var D = W.document;
+  var TF_HEADERS = ["Zaman Dilimi", "En \u0130yi TF"];
 
-  function openTicker(ticker) {
-    var map = P.__tvMap || {};
-    var symbol = map[ticker];
-    if (!symbol) { return false; }
-    P.open("https://www.tradingview.com/chart/?symbol=" + encodeURIComponent(symbol), "_blank", "noopener");
-    return true;
+  function config() {
+    try { return JSON.parse(W.__tvCfgJson || "{}"); } catch (e) { return {}; }
   }
 
-  function tickerColumn(grid) {
-    var heads = grid.querySelectorAll('th[role="columnheader"]');
-    for (var i = 0; i < heads.length; i++) {
-      if ((heads[i].textContent || "").trim() === "Hisse") {
-        return heads[i].getAttribute("aria-colindex");
-      }
+  function toast(message) {
+    try {
+      var old = D.getElementById("tv-toast");
+      if (old && old.parentNode) { old.parentNode.removeChild(old); }
+      var box = D.createElement("div");
+      box.id = "tv-toast";
+      box.textContent = message;
+      box.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:2147483647;padding:10px 14px;" +
+        "background:#111827;color:#f9fafb;border:1px solid #374151;border-radius:8px;" +
+        "font:13px sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.4);max-width:360px;";
+      D.body.appendChild(box);
+      W.setTimeout(function () { if (box.parentNode) { box.parentNode.removeChild(box); } }, 3000);
+    } catch (e) {}
+  }
+
+  function rowIndexOf(tr) {
+    var a = tr.getAttribute("row-index");
+    if (a !== null && a !== "") { return parseInt(a, 10); }
+    var b = tr.getAttribute("aria-rowindex");
+    if (b !== null && b !== "") { return parseInt(b, 10) - 2; }
+    return null;
+  }
+
+  function bodyRows(grid) {
+    return Array.prototype.slice.call(grid.querySelectorAll("tbody tr"));
+  }
+
+  function findRow(grid, index) {
+    var rows = bodyRows(grid);
+    for (var i = 0; i < rows.length; i++) {
+      if (rowIndexOf(rows[i]) === index) { return rows[i]; }
     }
     return null;
   }
 
-  function tickerFromRow(grid, row) {
-    var col = tickerColumn(grid);
-    if (!col || !row) { return null; }
-    var cell = row.querySelector('td[aria-colindex="' + col + '"]');
-    return cell ? (cell.textContent || "").trim() : null;
+  function headers(grid) {
+    var out = {};
+    var ths = grid.querySelectorAll("thead th");
+    for (var i = 0; i < ths.length; i++) {
+      var title = (ths[i].textContent || "").trim();
+      out[title] = { col: ths[i].getAttribute("aria-colindex"), pos: i };
+    }
+    return out;
   }
 
-  P.document.addEventListener("dblclick", function (ev) {
+  function cellText(row, head) {
+    if (!head) { return null; }
+    var cells = row.querySelectorAll("td");
+    if (head.col !== null) {
+      for (var i = 0; i < cells.length; i++) {
+        if (cells[i].getAttribute("aria-colindex") === head.col) {
+          return (cells[i].textContent || "").trim();
+        }
+      }
+    }
+    if (cells[head.pos]) { return (cells[head.pos].textContent || "").trim(); }
+    return null;
+  }
+
+  function selectedRowIndexes(grid) {
+    var seen = {};
+    var list = [];
+    var cells = grid.querySelectorAll('tbody td[aria-selected="true"]');
+    for (var i = 0; i < cells.length; i++) {
+      var idx = rowIndexOf(cells[i].parentNode);
+      if (idx !== null && !seen[idx]) { seen[idx] = true; list.push(idx); }
+    }
+    var rows = grid.querySelectorAll('tbody tr[aria-selected="true"]');
+    for (var j = 0; j < rows.length; j++) {
+      var rid = rowIndexOf(rows[j]);
+      if (rid !== null && !seen[rid]) { seen[rid] = true; list.push(rid); }
+    }
+    return list;
+  }
+
+  function pixelRow(frame, grid, ev) {
+    var canvas = frame.querySelector("canvas");
+    if (!canvas) { return null; }
+    var rect = canvas.getBoundingClientRect();
+    if (ev.clientX > rect.right - 14) { return -1; }
+    var scroller = frame.querySelector(".dvn-scroller");
+    var rowCount = parseInt(grid.getAttribute("aria-rowcount") || "0", 10);
+    var rowH = 35;
+    var scrollTop = 0;
+    if (scroller) {
+      scrollTop = scroller.scrollTop || 0;
+      if (rowCount > 1 && scroller.scrollHeight > scroller.clientHeight + 2) {
+        var derived = scroller.scrollHeight / rowCount;
+        if (Math.abs(derived - 35) > 3 && derived >= 20 && derived <= 60) { rowH = derived; }
+      }
+    }
+    var y = ev.clientY - rect.top + scrollTop - rowH;
+    if (y < 0) { return -1; }
+    return Math.floor(y / rowH);
+  }
+
+  function onDblClick(ev) {
+    if (ev.button !== 0) { return; }
     var target = ev.target;
     if (!target || !target.closest) { return; }
     var frame = target.closest('[data-testid="stDataFrame"]');
     if (!frame) { return; }
+    var cfg = config();
+    var map = cfg.map || {};
     var grid = frame.querySelector('table[role="grid"]');
-    if (!grid) { return; }
-    var ticker = null;
-    var canvas = frame.querySelector("canvas");
-    var scroller = frame.querySelector(".dvn-scroller");
-    if (canvas && scroller) {
-      var rect = canvas.getBoundingClientRect();
-      var y = ev.clientY - rect.top + scroller.scrollTop - HEADER_H;
-      if (y >= 0) {
-        var index = Math.floor(y / ROW_H);
-        var row = grid.querySelector('tr[row-index="' + index + '"]');
-        ticker = tickerFromRow(grid, row);
-      }
+    if (!grid) {
+      toast("\ud83d\udcc8 Tablo yap\u0131s\u0131 okunamad\u0131. Sat\u0131r\u0131 se\u00e7ip tablonun alt\u0131ndaki TradingView d\u00fc\u011fmesini kullan\u0131n.");
+      return;
     }
-    if (!ticker || !(P.__tvMap || {})[ticker]) {
-      var selected = grid.querySelector('tr[aria-selected="true"]');
-      ticker = tickerFromRow(grid, selected);
+    var heads = headers(grid);
+    var tickerHead = heads["Hisse"];
+    if (!tickerHead) { return; }
+
+    function resolve(idx) {
+      var row = findRow(grid, idx);
+      if (!row) { return null; }
+      var text = cellText(row, tickerHead);
+      if (text && map[text]) { return { row: row, ticker: text }; }
+      return null;
     }
-    if (ticker) { openTicker(ticker); }
-  }, true);
+
+    var px = pixelRow(frame, grid, ev);
+    if (px === -1) { return; }
+    var found = null;
+    if (px !== null) { found = resolve(px); }
+    if (!found) {
+      var selected = selectedRowIndexes(grid);
+      for (var k = 0; k < selected.length && !found; k++) { found = resolve(selected[k]); }
+    }
+    if (!found) {
+      toast("\ud83d\udcc8 Sat\u0131r bulunamad\u0131. Sat\u0131r\u0131 se\u00e7ip tablonun alt\u0131ndaki TradingView d\u00fc\u011fmesini kullan\u0131n.");
+      return;
+    }
+
+    var code = null;
+    for (var h = 0; h < TF_HEADERS.length && !code; h++) {
+      var label = cellText(found.row, heads[TF_HEADERS[h]]);
+      if (label && cfg.labels && cfg.labels[label]) { code = cfg.labels[label]; }
+    }
+    if (!code && cfg.tf && cfg.tf[found.ticker]) { code = cfg.tf[found.ticker]; }
+
+    var url = "https://www.tradingview.com/chart/?symbol=" + encodeURIComponent(map[found.ticker]);
+    if (code) { url += "&interval=" + encodeURIComponent(code); }
+    W.open(url, "_blank");
+    var name = (code && cfg.names && cfg.names[code]) ? (" \u00b7 " + cfg.names[code]) : "";
+    toast("\ud83d\udcc8 TradingView: " + map[found.ticker] + name);
+  }
+
+  if (W.__tvDblHandler) {
+    try { D.removeEventListener("dblclick", W.__tvDblHandler, true); } catch (e) {}
+  }
+  W.__tvDblHandler = onDblClick;
+  D.addEventListener("dblclick", onDblClick, true);
+}
+"""
+
+TV_INSTALL_HTML = """
+<script>
+(function () {
+  var P = window.parent;
+  if (!P || !P.document) { return; }
+  var code = __CODE__;
+  P.__tvCfgJson = __CFG__;
+  var done = false;
+  try { P.eval("(" + code + ")")(P); done = true; } catch (e1) {}
+  if (!done) {
+    try {
+      var s = P.document.createElement("script");
+      s.textContent = "(" + code + ")(window);";
+      P.document.head.appendChild(s);
+      done = true;
+    } catch (e2) {}
+  }
+  if (!done) {
+    try { (new Function("return (" + code + ")"))()(P); } catch (e3) {}
+  }
 })();
 </script>
 """
@@ -251,6 +383,27 @@ def build_tv_map(scan):
     return mapping
 
 
+def best_tf_keys(summary):
+    result = {}
+    if summary is not None and not summary.empty and "En İyi TF" in summary.columns:
+        for ticker, label in zip(summary["Hisse"], summary["En İyi TF"]):
+            key = TF_LABEL_TO_KEY.get(label)
+            if key:
+                result[str(ticker)] = key
+    return result
+
+
+def build_tv_cfg(scan, summary):
+    mapping = build_tv_map(scan)
+    best = best_tf_keys(summary)
+    return {
+        "map": mapping,
+        "tf": {ticker: TV_INTERVALS[key] for ticker, key in best.items()},
+        "labels": {TF_CONFIG[key]["label"]: code for key, code in TV_INTERVALS.items()},
+        "names": {code: TF_CONFIG[key]["label"] for key, code in TV_INTERVALS.items()},
+    }
+
+
 def tv_symbol_for(ticker, market):
     mapping = st.session_state.get("tv_map", {})
     symbol = mapping.get(ticker)
@@ -261,13 +414,19 @@ def tv_symbol_for(ticker, market):
     return ticker.replace("-", ".")
 
 
-def tv_url(ticker, market):
-    return TV_CHART_URL + quote(tv_symbol_for(ticker, market), safe="")
+def tv_url(ticker, market, tf=None):
+    url = TV_CHART_URL + quote(tv_symbol_for(ticker, market), safe="")
+    tf_key = tf or st.session_state.get("tv_best_tf", {}).get(ticker)
+    code = TV_INTERVALS.get(tf_key) if tf_key else None
+    if code:
+        url += "&interval=" + quote(code, safe="")
+    return url
 
 
-def inject_tv_dblclick(tv_map):
-    script = TV_DBLCLICK_JS.replace("__MAP__", json.dumps(tv_map))
-    components.html(script, height=0)
+def inject_tv_dblclick(cfg):
+    html = TV_INSTALL_HTML.replace("__CODE__", json.dumps(TV_HANDLER_JS))
+    html = html.replace("__CFG__", json.dumps(json.dumps(cfg)))
+    components.html(html, height=0)
 
 
 @st.cache_resource(show_spinner=False)
@@ -1265,7 +1424,7 @@ def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file
     st.caption(
         f"Gösterilen satır: {len(filtered)} / {len(work)}   ·   🟢 Yeşil   🟡 Sarı   🔴 Kırmızı   "
         "(satırların solundaki kutularla seçip aşağıdaki düğmelerle işaretleyin)   ·   "
-        "📈 Bir satıra çift tıklayınca TradingView'de açılır"
+        "📈 Bir satıra çift tıklayınca TradingView'de ilgili zaman diliminde açılır"
     )
     if filtered.empty:
         st.info("Filtrelerle eşleşen satır yok.")
@@ -1321,8 +1480,15 @@ def render_marked_table(df, key, market, column_config, ticker_col="Hisse", file
         use_container_width=True,
     )
     if selected_rows:
-        first_ticker = str(filtered.iloc[selected_rows[0]][ticker_col])
-        st.link_button(f"📈 {first_ticker} — TradingView'de aç", tv_url(first_ticker, market))
+        picked_row = filtered.iloc[selected_rows[0]]
+        first_ticker = str(picked_row[ticker_col])
+        tf_col = next((c for c in ("Zaman Dilimi", "En İyi TF") if c in filtered.columns), None)
+        tf_key = TF_LABEL_TO_KEY.get(str(picked_row[tf_col])) if tf_col else None
+        suffix = f" · {TF_CONFIG[tf_key]['label']}" if tf_key else ""
+        st.link_button(
+            f"📈 {first_ticker} — TradingView'de aç{suffix}",
+            tv_url(first_ticker, market, tf_key),
+        )
 
 
 def render_summary_tab(views, tfs, market):
@@ -1706,7 +1872,10 @@ def render_detail_tab(scan, views):
         }
     )
     st.dataframe(extra, hide_index=True, use_container_width=True)
-    st.link_button(f"📈 {ticker} — TradingView'de aç", tv_url(ticker, market))
+    st.link_button(
+        f"📈 {ticker} — TradingView'de aç · {TF_CONFIG[tf]['label']}",
+        tv_url(ticker, market, tf),
+    )
 
 
 def normalize_ticker(text, market):
@@ -1962,25 +2131,76 @@ def rank_row_style(row):
     return [css] * len(row)
 
 
-def render_backtest_ranking(scan, views, params, tf, period, capital, commission, slippage, fractional):
+def build_backtest_pairs(summary, matched, tf_pick, max_n):
+    order = {ticker: index for index, ticker in enumerate(summary["Hisse"].tolist())}
+    tf_order = {tf: index for index, tf in enumerate(TF_ORDER)}
+    pairs_df = matched[matched["tf"].isin(tf_pick)][["ticker", "tf"]].drop_duplicates().copy()
+    pairs_df["_o"] = pairs_df["ticker"].map(order).fillna(len(order))
+    pairs_df["_t"] = pairs_df["tf"].map(tf_order)
+    pairs_df = pairs_df.sort_values(["_o", "_t"]).head(int(max_n))
+    return tuple((str(row.ticker), str(row.tf)) for row in pairs_df.itertuples())
+
+
+def run_pair_backtests(pairs, periods, market, params, capital, commission, slippage, fractional):
+    grouped = {}
+    for ticker, tf in pairs:
+        grouped.setdefault(tf, []).append(ticker)
+    rows = []
+    failed = 0
+    for tf in TF_ORDER:
+        if tf not in grouped:
+            continue
+        part, bad = batch_backtest(
+            tuple(grouped[tf]), tf, periods[tf], market, params["length"], params["mult"],
+            params["method"], params["closed_only"], capital, commission, slippage, fractional,
+        )
+        for item in part:
+            entry = dict(item)
+            entry["tf"] = tf
+            rows.append(entry)
+        failed += bad
+    return rows, failed
+
+
+def render_backtest_ranking(scan, views, params, capital, commission, slippage, fractional):
     if scan is None or views is None:
         return
     st.markdown("---")
-    st.markdown("##### 🏆 Otomatik Toplu Backtest — Filtre Sonuçları")
+    st.markdown("##### 🏆 Otomatik Toplu Backtest — Filtre Sonuçları (her hisse kendi zaman diliminde)")
     summary = views["summary"]
-    if summary.empty:
+    matched = views["matched"]
+    if summary.empty or matched.empty:
         st.info("Filtre sonuçlarında hisse yok. Önce sol menüdeki sinyal filtrelerini gevşetin.")
         return
     market = scan["params"]["market"]
-    c1, c2, c3, c4 = st.columns([1.5, 1, 1.2, 1])
+    scan_tfs = list(scan["params"]["tfs"])
+    tf_key_suffix = "_".join(scan_tfs)
+    c1, c2, c3 = st.columns([1.3, 1.5, 1.2])
     auto = c1.checkbox("Filtre sonuçlarını otomatik backtest'e al", value=True, key="bt_auto")
-    max_n = c2.slider("En fazla hisse", 5, 100, 30, 5, key="bt_max_n")
-    rank_label = c3.selectbox("Sıralama ölçütü", list(RANK_METRICS.keys()), key="bt_rank_metric")
-    min_trades = c4.number_input("Min. işlem sayısı", 0, 100, 1, 1, key="bt_min_trades")
+    tf_pick = c2.multiselect(
+        "Zaman dilimleri", scan_tfs, default=scan_tfs,
+        format_func=lambda x: TF_CONFIG[x]["label"], key=f"bt_auto_tfs_{tf_key_suffix}",
+    )
+    period_mode = c3.selectbox("Geçmiş veri uzunluğu", list(AUTO_PERIOD_MODES.keys()), key="bt_period_mode")
+    c4, c5, c6 = st.columns([1.2, 1.5, 1])
+    max_n = c4.slider("En fazla (hisse × zaman dilimi)", 5, 150, 40, 5, key="bt_max_n")
+    rank_label = c5.selectbox("Sıralama ölçütü", list(RANK_METRICS.keys()), key="bt_rank_metric")
+    min_trades = c6.number_input("Min. işlem sayısı", 0, 100, 1, 1, key="bt_min_trades")
+    periods = AUTO_PERIOD_MODES[period_mode]
+    st.caption(
+        "Her hisse, taramada sinyal verdiği zaman diliminin verisiyle backtest edilir. "
+        "Veri dönemi: " + " · ".join(f"{TF_CONFIG[tf]['label']}: {periods[tf]}" for tf in TF_ORDER)
+    )
+    if not tf_pick:
+        st.info("En az bir zaman dilimi seçin.")
+        return
 
-    tickers = tuple(summary["Hisse"].head(int(max_n)).tolist())
+    pairs = build_backtest_pairs(summary, matched, tf_pick, max_n)
+    if not pairs:
+        st.info("Seçili zaman dilimlerinde eşleşen sinyal yok.")
+        return
     signature = (
-        tickers, tf, period, market, params["length"], params["mult"], params["method"],
+        pairs, period_mode, market, params["length"], params["mult"], params["method"],
         params["closed_only"], capital, commission, slippage, fractional,
     )
     store = st.session_state.get("bt_batch")
@@ -1989,10 +2209,9 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
         if st.button("▶️ Toplu Backtest'i Çalıştır", key="bt_batch_run"):
             run_now = True
     if run_now:
-        with st.spinner(f"{len(tickers)} hisse için {TF_CONFIG[tf]['label']} backtest hesaplanıyor..."):
-            rows, failed = batch_backtest(
-                tickers, tf, period, market, params["length"], params["mult"], params["method"],
-                params["closed_only"], capital, commission, slippage, fractional,
+        with st.spinner(f"{len(pairs)} hisse × zaman dilimi için backtest hesaplanıyor..."):
+            rows, failed = run_pair_backtests(
+                pairs, periods, market, params, capital, commission, slippage, fractional,
             )
         store = {"sig": signature, "rows": rows, "failed": failed}
         st.session_state["bt_batch"] = store
@@ -2002,7 +2221,7 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
     if store["sig"] != signature:
         st.warning("Gösterilen sıralama önceki ayarlara aittir. Güncellemek için düğmeye basın veya otomatik modu açın.")
     if not store["rows"]:
-        st.warning("Hiçbir hisse için backtest hesaplanamadı. Veri aralığını veya zaman dilimini değiştirin.")
+        st.warning("Hiçbir hisse için backtest hesaplanamadı. Veri uzunluğunu veya zaman dilimlerini değiştirin.")
         return
 
     result_df = pd.DataFrame(store["rows"])
@@ -2010,7 +2229,7 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
     result_df["name"] = result_df["ticker"].map(names).fillna(result_df["ticker"])
     result_df = result_df[result_df["trade_count"] >= int(min_trades)]
     if result_df.empty:
-        st.info("Min. işlem sayısı koşulunu sağlayan hisse yok. Değeri düşürün.")
+        st.info("Min. işlem sayısı koşulunu sağlayan satır yok. Değeri düşürün.")
         return
     metric_col = RANK_METRICS[rank_label]
     result_df[metric_col] = pd.to_numeric(result_df[metric_col], errors="coerce")
@@ -2021,6 +2240,8 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
             "Sıra": np.arange(1, len(result_df) + 1),
             "Hisse": result_df["ticker"],
             "Şirket": result_df["name"],
+            "Zaman Dilimi": result_df["tf"].map(lambda tf: TF_CONFIG[tf]["label"]),
+            "Dönem": result_df["tf"].map(lambda tf: periods[tf]),
             "Strateji Getirisi %": result_df["total_ret"],
             "Al-Tut %": result_df["bh_ret"],
             "Fark (puan)": result_df["excess"],
@@ -2038,18 +2259,22 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
 
     best = result_df.iloc[0]
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Backtest Edilen", f"{len(result_df)} / {len(tickers)}")
-    m2.metric("En İyi", f"{best['ticker']}", f"{best[metric_col]:.2f}" if pd.notna(best[metric_col]) else None)
+    m1.metric("Backtest Edilen", f"{len(result_df)} / {len(pairs)}")
+    m2.metric(
+        "En İyi", f"{best['ticker']} · {TF_CONFIG[best['tf']]['label']}",
+        f"{best[metric_col]:.2f}" if pd.notna(best[metric_col]) else None,
+    )
     m3.metric("Ort. Strateji Getirisi", f"{result_df['total_ret'].mean():.2f}%")
     m4.metric("Al-Tut'u Geçen", f"{int((result_df['excess'] > 0).sum())} / {len(result_df)}")
     if store["failed"]:
-        st.caption(f"Veri alınamayan veya yetersiz barlı hisse sayısı: {store['failed']}")
+        st.caption(f"Veri alınamayan veya yetersiz barlı satır sayısı: {store['failed']}")
 
     top_n = result_df.head(20).iloc[::-1]
     bar_values = top_n[metric_col].fillna(0.0)
+    bar_labels = top_n["ticker"] + " · " + top_n["tf"]
     rank_fig = go.Figure(
         go.Bar(
-            x=bar_values, y=top_n["ticker"], orientation="h",
+            x=bar_values, y=bar_labels, orientation="h",
             marker_color=np.where(bar_values >= 0, "#26a69a", "#ef5350"),
             hovertemplate="%{y}: %{x:.2f}<extra></extra>",
         )
@@ -2072,7 +2297,10 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
         "Piyasada %": st.column_config.NumberColumn(format="%.1f"),
         "CAGR %": st.column_config.NumberColumn(format="%.2f"),
     }
-    st.caption("İlk 3 hisse yeşil işaretlidir. Bir satıra çift tıklayınca TradingView'de açılır, tek tıklayınca seçilir.")
+    st.caption(
+        "İlk 3 satır yeşil işaretlidir. Bir satıra çift tıklayınca TradingView'de o satırın zaman diliminde açılır, "
+        "tek tıklayınca seçilir."
+    )
     event = st.dataframe(
         table.replace([np.inf, -np.inf], np.nan).style.apply(rank_row_style, axis=1),
         column_config=config,
@@ -2089,14 +2317,20 @@ def render_backtest_ranking(scan, views, params, tf, period, capital, commission
         selected = []
     if selected:
         chosen = str(table.iloc[selected[0]]["Hisse"])
+        chosen_tf = str(result_df.iloc[selected[0]]["tf"])
+        chosen_label = TF_CONFIG[chosen_tf]["label"]
         b1, b2 = st.columns(2)
-        if b1.button(f"🔍 {chosen} için detaylı backtest'i göster", key="bt_rank_detail"):
-            with st.spinner(f"{chosen} için detaylı backtest hesaplanıyor..."):
+        if b1.button(f"🔍 {chosen} · {chosen_label} için detaylı backtest'i göster", key="bt_rank_detail"):
+            with st.spinner(f"{chosen} ({chosen_label}) için detaylı backtest hesaplanıyor..."):
                 st.session_state["bt_result"] = execute_backtest(
-                    chosen, tf, period, market, params, capital, commission, slippage, fractional,
+                    chosen, chosen_tf, periods[chosen_tf], market, params,
+                    capital, commission, slippage, fractional,
                 )
             st.success("Detaylı sonuç aşağıdaki 'Tek Hisse Backtest' bölümünde gösterilir.")
-        b2.link_button(f"📈 {chosen} — TradingView'de aç", tv_url(chosen, market))
+        b2.link_button(
+            f"📈 {chosen} — TradingView'de aç · {chosen_label}",
+            tv_url(chosen, market, chosen_tf),
+        )
     else:
         st.caption("Satıra tıklayıp seçin: detaylı backtest ve TradingView seçenekleri görünür.")
     st.download_button(
@@ -2287,8 +2521,14 @@ def render_backtest_tab(scan, views, params):
         "veya sembol yazın (örn. AAPL, THYAO)", key="bt_manual",
         help="Doluysa listedeki seçimin yerine geçer.",
     )
-    tf = col2.selectbox("Zaman dilimi", TF_ORDER, index=2, format_func=lambda x: TF_CONFIG[x]["label"], key="bt_tf")
-    period = col3.selectbox("Geçmiş veri", BT_PERIODS[tf], index=min(1, len(BT_PERIODS[tf]) - 1), key=f"bt_period_{tf}")
+    tf = col2.selectbox(
+        "Zaman dilimi (tek hisse)", TF_ORDER, index=2,
+        format_func=lambda x: TF_CONFIG[x]["label"], key="bt_tf",
+    )
+    period = col3.selectbox(
+        "Geçmiş veri (tek hisse)", BT_PERIODS[tf],
+        index=min(1, len(BT_PERIODS[tf]) - 1), key=f"bt_period_{tf}",
+    )
     c1, c2, c3, c4 = st.columns(4)
     capital = c1.number_input(f"Başlangıç sermayesi ({mkt['currency']})", 100.0, 1_000_000_000.0, 1000.0, 100.0, key="bt_capital")
     commission = c2.number_input("Komisyon % (her işlem yönü)", 0.0, 5.0, 0.04, 0.01, key="bt_commission")
@@ -2296,10 +2536,12 @@ def render_backtest_tab(scan, views, params):
     fractional = c4.checkbox("Kesirli hisse", value=True, key="bt_fractional")
     st.caption(
         f"Pine parametreleri sol menüden alınır: Swing={params['length']}, Slope={params['mult']}, "
-        f"Yöntem={params['method']}, Yalnızca kapanmış barlar={'Evet' if params['closed_only'] else 'Hayır'}"
+        f"Yöntem={params['method']}, Yalnızca kapanmış barlar={'Evet' if params['closed_only'] else 'Hayır'}. "
+        "Zaman dilimi ve geçmiş veri seçimi yalnızca tek hisse backtest içindir. "
+        "Otomatik toplu backtest her hisseyi kendi sinyal zaman diliminde çalıştırır."
     )
     render_backtest_ranking(
-        scan, views, params, tf, period, float(capital), float(commission), float(slippage), bool(fractional),
+        scan, views, params, float(capital), float(commission), float(slippage), bool(fractional),
     )
     if scan is not None:
         st.markdown("---")
@@ -2357,7 +2599,9 @@ Birden fazla tür seçilirse bunlardan birini sağlayan hisse listelenir. Yakla�
 - Her tabloda **🔎 Tablo filtreleri ve sıralama** bölümü vardır: metin arama, istediğiniz sütunlar için aralık veya çoklu seçim filtresi, sıralama. Filtreler birlikte (VE mantığıyla) uygulanır.
 - Satırların solundaki kutularla seçip **🟢 Yeşil / 🟡 Sarı / 🔴 Kırmızı** düğmeleriyle işaretleyin. Satırlar renklenir. "İşaret" sütunu da filtrelenebilir.
 - İşaretler tüm tablolarda ortaktır. Sol menüden CSV olarak indirilip yüklenebilir.
-- **Bir satıra çift tıklayınca** hissenin TradingView grafiği yeni sekmede açılır (doğru borsa koduyla: `NASDAQ:`, `NYSE:`, `BIST:`). Tarayıcı açılır pencereleri engellerse izin verin. Satır seçilince çıkan **📈 TradingView'de aç** düğmesi yedek yoldur.
+- **Bir satıra çift tıklayınca** hissenin TradingView grafiği yeni sekmede, ilgili zaman diliminde açılır (doğru borsa koduyla: `NASDAQ:`, `NYSE:`, `BIST:`). Sağ altta hangi sembolün hangi zaman diliminde açıldığını söyleyen kısa bir bildirim görünür. Tarayıcı açılır pencereleri engellerse izin verin.
+- Zaman dilimi, satırdaki "Zaman Dilimi" veya "En İyi TF" sütunundan alınır. Bu sütunlar yoksa hissenin en iyi skor aldığı zaman dilimi kullanılır.
+- Satır seçilince çıkan **📈 TradingView'de aç** düğmesi yedek yoldur ve aynı zaman dilimiyle açar.
 
 ### Backtest
 
@@ -2368,10 +2612,11 @@ Birden fazla tür seçilirse bunlardan birini sağlayan hisse listelenir. Yakla�
 
 ### Otomatik Toplu Backtest
 
-- Filtreden çıkan hisseler (en fazla 100) sekmedeki zaman dilimi, veri uzunluğu ve maliyet ayarlarıyla otomatik olarak backtest'e alınır.
+- Filtreden çıkan her **(hisse × zaman dilimi)** çifti, o zaman diliminin verisiyle ayrı ayrı backtest edilir. Bir hisse birden fazla zaman diliminde sinyal verdiyse her biri ayrı satırdır.
+- Veri uzunluğu zaman dilimine göre otomatik seçilir (Otomatik: 1h/4h → 1y, 1d → 5y, 1w → 10y). "Kısa" ve "Uzun" modları da vardır.
 - Sonuçlar seçtiğiniz ölçüte göre sıralanır: strateji getirisi, Al-Tut'a göre fark, getiri/maks. düşüş, Profit Factor, kazanma oranı, maks. düşüş (en az düşüş) veya CAGR.
-- "Min. işlem sayısı" ile hiç işlem yapmayan hisseler elenir. Profit Factor sonsuz çıkarsa 99.99 olarak gösterilir.
-- Tabloda bir hisse seçip detaylı backtest'i veya TradingView'i açabilirsiniz.
+- "Min. işlem sayısı" ile hiç işlem yapmayan satırlar elenir. Profit Factor sonsuz çıkarsa 99.99 olarak gösterilir.
+- Tabloda bir satır seçip o zaman diliminde detaylı backtest'i veya TradingView'i açabilirsiniz.
 - Sıralama geçmiş veriye dayanır ve aşırı uyum riski taşır. Gelecek performansı garanti etmez.
 
 ### Breakout Skoru (0–100)
@@ -2451,10 +2696,11 @@ def main():
         st.error("Tarama sonucu boş.")
         return
 
-    tv_map = build_tv_map(scan)
-    st.session_state["tv_map"] = tv_map
-
     summary = views["summary"]
+    tv_cfg = build_tv_cfg(scan, summary)
+    st.session_state["tv_map"] = tv_cfg["map"]
+    st.session_state["tv_best_tf"] = best_tf_keys(summary)
+
     matched = views["matched"]
     tfs = scan["params"]["tfs"]
     approach_count = int(matched.loc[matched["kind"] == SIGNAL_APPROACH, "ticker"].nunique()) if not matched.empty else 0
@@ -2487,7 +2733,7 @@ def main():
     with tab7:
         render_method_tab()
 
-    inject_tv_dblclick(tv_map)
+    inject_tv_dblclick(tv_cfg)
 
 
 main()
